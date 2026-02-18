@@ -4,7 +4,7 @@
 ║                      CREDIT MANAGER                                ║
 ║                                                                    ║
 ║  Provides the @require_credit decorator and credit helpers.        ║
-║  FIXED: HTML parse mode, clean async, Python 3.13 compatible.      ║
+║  UPDATED: Deny messages include direct owner contact link.         ║
 ╚══════════════════════════════════════════════════════════════════════╝
 """
 
@@ -29,6 +29,27 @@ OWNER_USERNAME: str = "@EK_HENG"
 
 FREE_DAILY_LIMIT: int = 5
 PREMIUM_DAILY_LIMIT: int = 50
+
+
+# ==========================================================================
+# HTML helper
+# ==========================================================================
+def h(text) -> str:
+    if not isinstance(text, str):
+        text = str(text)
+    return html_escape(text, quote=False)
+
+
+# ==========================================================================
+# Build owner contact link
+# ==========================================================================
+def _owner_link() -> str:
+    """Return clickable HTML link to owner's Telegram."""
+    username_clean = OWNER_USERNAME.lstrip("@")
+    return (
+        f'<a href="https://t.me/{username_clean}">'
+        f'{h(OWNER_USERNAME)}</a>'
+    )
 
 
 # ==========================================================================
@@ -57,20 +78,36 @@ async def check_and_deduct(
     if used >= limit:
         if role == "free":
             msg = (
-                "🚫 <b>Daily limit reached</b>\n\n"
+                "🚫 <b>Daily limit reached</b>\n"
+                "━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+                "\n"
                 f"Free users get <b>{FREE_DAILY_LIMIT}</b> "
                 f"commands/day.\n"
                 f"You've used <b>{used}/{limit}</b>.\n\n"
-                "Resets at <code>00:00 UTC</code>.\n"
-                "Contact the owner to upgrade to Premium!"
+                "⏰ Resets at <code>00:00 UTC</code>.\n"
+                "\n"
+                "━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+                "\n"
+                "💎 <b>Want more?</b> Upgrade to Premium!\n"
+                f"📩 Contact: {_owner_link()}\n"
+                f"📋 Your ID: <code>{user_id}</code>\n"
+                "\n"
+                "Or use /upgrade for details."
             )
         else:
             msg = (
-                "🚫 <b>Daily limit reached</b>\n\n"
-                f"Premium users get <b>{PREMIUM_DAILY_LIMIT}</b> "
+                "🚫 <b>Daily limit reached</b>\n"
+                "━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+                "\n"
+                f"Premium users get "
+                f"<b>{PREMIUM_DAILY_LIMIT}</b> "
                 f"commands/day.\n"
                 f"You've used <b>{used}/{limit}</b>.\n\n"
-                "Resets at <code>00:00 UTC</code>."
+                "⏰ Resets at <code>00:00 UTC</code>.\n"
+                "\n"
+                "━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+                "\n"
+                f"Need more? Contact: {_owner_link()}"
             )
         return False, msg
 
@@ -91,7 +128,7 @@ def require_credit(
     Before the wrapped handler executes:
         1. Checks / creates user in DB.
         2. Resets daily counter if new UTC day.
-        3. Blocks if over limit (sends a message).
+        3. Blocks if over limit (sends message with upgrade link).
         4. Deducts 1 credit.
         5. Owner is never blocked or deducted.
     """
@@ -110,14 +147,19 @@ def require_credit(
         user_id = user.id
         username = user.username
 
-        allowed, deny_msg = await check_and_deduct(user_id, username)
+        allowed, deny_msg = await check_and_deduct(
+            user_id, username
+        )
 
         if not allowed:
             await update.message.reply_text(
-                deny_msg, parse_mode=ParseMode.HTML
+                deny_msg,
+                parse_mode=ParseMode.HTML,
+                disable_web_page_preview=True,
             )
             logger.info(
-                f"Credit denied for user {user_id} (@{username})"
+                f"Credit denied for user {user_id} "
+                f"(@{username})"
             )
             return
 
