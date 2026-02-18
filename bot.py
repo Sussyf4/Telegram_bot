@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
 """
 ╔══════════════════════════════════════════════════════════════════════╗
-║                    XAUUSD AI ANALYSIS BOT v3.1                     ║
+║                    XAUUSD AI ANALYSIS BOT v3.2                     ║
 ║                                                                    ║
 ║  Production-ready Telegram bot for XAU/USD technical analysis      ║
 ║  Uses: google-genai SDK, Twelve Data, python-telegram-bot          ║
-║  FIXES: HTML parse mode, no event-loop-in-thread, Python 3.13     ║
+║  NEW: /checkid, /upgrade, owner contact in deny messages           ║
 ╚══════════════════════════════════════════════════════════════════════╝
 """
 
@@ -47,7 +47,12 @@ from telegram.constants import ParseMode
 
 # Credit system modules
 import db
-from credit_manager import require_credit, OWNER_ID, is_owner
+from credit_manager import (
+    require_credit,
+    OWNER_ID,
+    OWNER_USERNAME,
+    is_owner,
+)
 import admin_commands
 
 # =============================================================================
@@ -122,9 +127,7 @@ COLOR_GRAY = "gray"
 def h(text) -> str:
     """
     Safely escape any value for Telegram HTML parse mode.
-    Handles: < > & (the only three characters HTML requires escaping).
-    This replaces the old _escape_md() and eliminates all
-    MarkdownV2 parsing crashes permanently.
+    Handles: < > & (the only three characters HTML requires).
     """
     if not isinstance(text, str):
         text = str(text)
@@ -227,37 +230,40 @@ class RateLimiter:
                 oldest = self.calls[0]
                 wait_time = self.period - (now - oldest) + 0.5
                 logger.warning(
-                    f"Rate limit reached. Waiting {wait_time:.1f}s..."
+                    f"Rate limit reached. "
+                    f"Waiting {wait_time:.1f}s..."
                 )
                 await asyncio.sleep(wait_time)
                 now = time.monotonic()
                 self.calls = [
-                    t for t in self.calls if now - t < self.period
+                    t for t in self.calls
+                    if now - t < self.period
                 ]
             self.calls.append(time.monotonic())
             return True
 
 
-twelvedata_limiter = RateLimiter(max_calls=7, period_seconds=60.0)
+twelvedata_limiter = RateLimiter(
+    max_calls=7, period_seconds=60.0
+)
 user_sessions: dict[int, UserSession] = {}
 
 
 # =============================================================================
-# MODULE 1: TWELVE DATA CLIENT (PURELY SYNCHRONOUS — NO ASYNCIO)
+# MODULE 1: TWELVE DATA CLIENT (PURELY SYNCHRONOUS)
 # =============================================================================
 class TwelveDataClient:
     """
     Synchronous HTTP client for Twelve Data.
-    CRITICAL: No asyncio calls here. These methods run inside
-    run_in_executor() thread pool. API tracking happens in the
-    calling async handler AFTER the executor returns.
+    NO asyncio calls. Runs inside run_in_executor().
+    API tracking happens in calling async handler.
     """
 
     def __init__(self, api_key: str):
         self.api_key = api_key
         self.session = requests.Session()
         self.session.headers.update(
-            {"User-Agent": "XAUUSD-AI-Bot/3.1"}
+            {"User-Agent": "XAUUSD-AI-Bot/3.2"}
         )
 
     def fetch_time_series(
@@ -292,13 +298,17 @@ class TwelveDataClient:
                 )
                 return None
             if "values" not in data or not data["values"]:
-                logger.error("Twelve Data returned empty values")
+                logger.error(
+                    "Twelve Data returned empty values"
+                )
                 return None
 
             df = pd.DataFrame(data["values"])
             df["datetime"] = pd.to_datetime(df["datetime"])
             for col in ["open", "high", "low", "close"]:
-                df[col] = pd.to_numeric(df[col], errors="coerce")
+                df[col] = pd.to_numeric(
+                    df[col], errors="coerce"
+                )
             if "volume" in df.columns:
                 df["volume"] = (
                     pd.to_numeric(
@@ -308,13 +318,15 @@ class TwelveDataClient:
             else:
                 df["volume"] = 0
 
-            df = df.sort_values("datetime").reset_index(drop=True)
+            df = df.sort_values("datetime").reset_index(
+                drop=True
+            )
             df = df.dropna(
                 subset=["open", "high", "low", "close"]
             ).reset_index(drop=True)
-            logger.info(f"Fetched {len(df)} candles for {SYMBOL}")
-
-            # NO asyncio calls here — tracking done by caller
+            logger.info(
+                f"Fetched {len(df)} candles for {SYMBOL}"
+            )
             return df
 
         except requests.exceptions.Timeout:
@@ -322,7 +334,9 @@ class TwelveDataClient:
         except requests.exceptions.ConnectionError:
             logger.error("Failed to connect to Twelve Data")
         except requests.exceptions.HTTPError as exc:
-            logger.error(f"HTTP error from Twelve Data: {exc}")
+            logger.error(
+                f"HTTP error from Twelve Data: {exc}"
+            )
         except (ValueError, KeyError) as exc:
             logger.error(
                 f"Error parsing Twelve Data response: {exc}"
@@ -343,15 +357,16 @@ class TwelveDataClient:
             response.raise_for_status()
             data = response.json()
             if "price" not in data:
-                logger.error(f"No price in response: {data}")
+                logger.error(
+                    f"No price in response: {data}"
+                )
                 return None
 
-            # NO asyncio calls here — tracking done by caller
             return {
                 "price": float(data["price"]),
-                "timestamp": datetime.now(timezone.utc).strftime(
-                    "%Y-%m-%d %H:%M:%S UTC"
-                ),
+                "timestamp": datetime.now(
+                    timezone.utc
+                ).strftime("%Y-%m-%d %H:%M:%S UTC"),
             }
         except Exception as exc:
             logger.error(f"Error fetching price: {exc}")
@@ -379,12 +394,10 @@ class TechnicalAnalysisEngine:
             )
             return df, indicators
 
-        # RSI (14)
         df["rsi"] = ta.momentum.RSIIndicator(
             close=df["close"], window=14
         ).rsi()
 
-        # EMA 20 & 50
         df["ema_20"] = ta.trend.EMAIndicator(
             close=df["close"], window=20
         ).ema_indicator()
@@ -392,7 +405,6 @@ class TechnicalAnalysisEngine:
             close=df["close"], window=50
         ).ema_indicator()
 
-        # MACD (12, 26, 9)
         macd_calc = ta.trend.MACD(
             close=df["close"],
             window_slow=26,
@@ -403,7 +415,6 @@ class TechnicalAnalysisEngine:
         df["macd_signal"] = macd_calc.macd_signal()
         df["macd_histogram"] = macd_calc.macd_diff()
 
-        # ATR (14)
         df["atr"] = ta.volatility.AverageTrueRange(
             high=df["high"],
             low=df["low"],
@@ -411,9 +422,9 @@ class TechnicalAnalysisEngine:
             window=14,
         ).average_true_range()
 
-        # Support & Resistance
         support, resistance = (
-            TechnicalAnalysisEngine._detect_support_resistance(df)
+            TechnicalAnalysisEngine
+            ._detect_support_resistance(df)
         )
 
         latest = df.iloc[-1]
@@ -456,7 +467,6 @@ class TechnicalAnalysisEngine:
         indicators.support = round(support, 2)
         indicators.resistance = round(resistance, 2)
 
-        # RSI Interpretation
         if indicators.rsi >= 70:
             indicators.rsi_interpretation = "Overbought"
         elif indicators.rsi >= 60:
@@ -468,7 +478,6 @@ class TechnicalAnalysisEngine:
         else:
             indicators.rsi_interpretation = "Oversold"
 
-        # EMA Trend
         if indicators.ema_20 > indicators.ema_50:
             if latest["close"] > indicators.ema_20:
                 indicators.ema_trend = "Strong Bullish"
@@ -482,7 +491,6 @@ class TechnicalAnalysisEngine:
         else:
             indicators.ema_trend = "Neutral"
 
-        # MACD
         if indicators.macd_histogram > 0:
             indicators.macd_interpretation = "Positive"
         elif indicators.macd_histogram < 0:
@@ -490,7 +498,6 @@ class TechnicalAnalysisEngine:
         else:
             indicators.macd_interpretation = "Neutral"
 
-        # Volatility
         atr_pct = (
             (indicators.atr / latest["close"]) * 100
             if latest["close"] > 0
@@ -499,11 +506,12 @@ class TechnicalAnalysisEngine:
         if atr_pct > 1.0:
             indicators.volatility_condition = "High Volatility"
         elif atr_pct > 0.5:
-            indicators.volatility_condition = "Moderate Volatility"
+            indicators.volatility_condition = (
+                "Moderate Volatility"
+            )
         else:
             indicators.volatility_condition = "Low Volatility"
 
-        # Overall Trend
         bullish = sum([
             indicators.rsi > 50,
             indicators.ema_20 > indicators.ema_50,
@@ -530,10 +538,18 @@ class TechnicalAnalysisEngine:
         swing_highs = []
 
         for i in range(window, len(recent) - window):
-            segment = recent.iloc[i - window : i + window + 1]
-            if recent.iloc[i]["low"] == segment["low"].min():
+            segment = recent.iloc[
+                i - window : i + window + 1
+            ]
+            if (
+                recent.iloc[i]["low"]
+                == segment["low"].min()
+            ):
                 swing_lows.append(recent.iloc[i]["low"])
-            if recent.iloc[i]["high"] == segment["high"].max():
+            if (
+                recent.iloc[i]["high"]
+                == segment["high"].max()
+            ):
                 swing_highs.append(recent.iloc[i]["high"])
 
         support = (
@@ -558,14 +574,9 @@ ta_engine = TechnicalAnalysisEngine()
 
 
 # =============================================================================
-# MODULE 3: GEMINI AI ANALYSIS (PURELY SYNCHRONOUS — NO ASYNCIO)
+# MODULE 3: GEMINI AI ANALYSIS (PURELY SYNCHRONOUS)
 # =============================================================================
 class GeminiAnalyzer:
-    """
-    Synchronous Gemini client.
-    CRITICAL: No asyncio calls. Runs inside run_in_executor().
-    API tracking happens in the calling async handler.
-    """
 
     def __init__(self, api_key: str):
         self.client = genai.Client(api_key=api_key)
@@ -573,8 +584,8 @@ class GeminiAnalyzer:
         self._max_retries = 3
         self._retry_delay = 2.0
         logger.info(
-            f"Gemini AI initialized | model: {self.model_name} | "
-            f"SDK: google-genai (new)"
+            f"Gemini AI initialized | model: "
+            f"{self.model_name} | SDK: google-genai"
         )
 
     def generate_analysis(
@@ -605,26 +616,32 @@ class GeminiAnalyzer:
                     f"{attempt}/{self._max_retries}..."
                 )
 
-                response = self.client.models.generate_content(
-                    model=self.model_name,
-                    contents=prompt,
-                    config=types.GenerateContentConfig(
-                        temperature=0.3,
-                        max_output_tokens=1024,
-                    ),
+                response = (
+                    self.client.models.generate_content(
+                        model=self.model_name,
+                        contents=prompt,
+                        config=types.GenerateContentConfig(
+                            temperature=0.3,
+                            max_output_tokens=1024,
+                        ),
+                    )
                 )
-
-                # NO asyncio calls — tracking done by caller
 
                 raw_text = response.text
 
-                if not raw_text or len(raw_text.strip()) < 20:
+                if (
+                    not raw_text
+                    or len(raw_text.strip()) < 20
+                ):
                     logger.warning(
-                        f"Attempt {attempt}: Empty/short response"
+                        f"Attempt {attempt}: "
+                        f"Empty/short response"
                     )
                     last_error = "Empty response from AI"
                     if attempt < self._max_retries:
-                        time.sleep(self._retry_delay * attempt)
+                        time.sleep(
+                            self._retry_delay * attempt
+                        )
                     continue
 
                 analysis.raw_response = raw_text
@@ -633,43 +650,62 @@ class GeminiAnalyzer:
                     f"({len(raw_text)} chars)"
                 )
 
-                analysis = self._parse_response(raw_text, analysis)
+                analysis = self._parse_response(
+                    raw_text, analysis
+                )
 
-                if analysis.bias not in ("N/A", "Error", ""):
+                if analysis.bias not in (
+                    "N/A", "Error", ""
+                ):
                     logger.info(
-                        f"AI analysis parsed: bias={analysis.bias}"
+                        f"AI analysis parsed: "
+                        f"bias={analysis.bias}"
                     )
                     return analysis
 
                 logger.warning(
-                    f"Attempt {attempt}: Parsing incomplete, "
+                    f"Attempt {attempt}: "
+                    f"Parsing incomplete, "
                     f"trying fallback regex..."
                 )
-                analysis = self._fallback_parse(raw_text, analysis)
-                if analysis.bias not in ("N/A", "Error", ""):
+                analysis = self._fallback_parse(
+                    raw_text, analysis
+                )
+                if analysis.bias not in (
+                    "N/A", "Error", ""
+                ):
                     return analysis
 
                 if attempt < self._max_retries:
-                    time.sleep(self._retry_delay * attempt)
+                    time.sleep(
+                        self._retry_delay * attempt
+                    )
                 continue
 
             except Exception as exc:
                 last_error = str(exc)
                 logger.error(
-                    f"Attempt {attempt}/{self._max_retries} "
+                    f"Attempt "
+                    f"{attempt}/{self._max_retries} "
                     f"failed: {exc}"
                 )
                 logger.debug(traceback.format_exc())
                 if attempt < self._max_retries:
-                    sleep_time = self._retry_delay * attempt
-                    logger.info(f"Retrying in {sleep_time}s...")
+                    sleep_time = (
+                        self._retry_delay * attempt
+                    )
+                    logger.info(
+                        f"Retrying in {sleep_time}s..."
+                    )
                     time.sleep(sleep_time)
 
         logger.error(
             f"All {self._max_retries} attempts failed. "
             f"Last error: {last_error}"
         )
-        analysis = self._generate_fallback_analysis(indicators, df)
+        analysis = self._generate_fallback_analysis(
+            indicators, df
+        )
         return analysis
 
     def _build_prompt(
@@ -695,9 +731,9 @@ class GeminiAnalyzer:
         session_low = df["low"].tail(20).min()
 
         prompt = (
-            "You are a senior XAUUSD (Gold) technical analyst. "
-            "Analyze this data and respond in the EXACT format "
-            "below.\n"
+            "You are a senior XAUUSD (Gold) technical "
+            "analyst. Analyze this data and respond in "
+            "the EXACT format below.\n"
             "\n"
             f"MARKET DATA - XAU/USD ({timeframe})\n"
             "\n"
@@ -752,7 +788,8 @@ class GeminiAnalyzer:
             "- If unclear, recommend Wait\n"
             "- NO markdown, NO asterisks, NO bullet points\n"
             "- NO text before BIAS or after OUTLOOK\n"
-            "- Each field MUST start at beginning of a new line"
+            "- Each field MUST start at beginning of a "
+            "new line"
         )
         return prompt
 
@@ -787,21 +824,29 @@ class GeminiAnalyzer:
             if key in ("BIAS", "MARKET BIAS"):
                 analysis.bias = value
             elif key in (
-                "TRADE", "TRADE IDEA", "ACTION", "SIGNAL"
+                "TRADE", "TRADE IDEA",
+                "ACTION", "SIGNAL",
             ):
                 analysis.trade_idea = value
-            elif key in ("ENTRY", "ENTRY ZONE", "ENTRY PRICE"):
+            elif key in (
+                "ENTRY", "ENTRY ZONE", "ENTRY PRICE",
+            ):
                 analysis.entry = value
             elif key in (
-                "STOP_LOSS", "STOP LOSS", "SL", "STOPLOSS"
+                "STOP_LOSS", "STOP LOSS",
+                "SL", "STOPLOSS",
             ):
                 analysis.stop_loss = value
-            elif key in ("TP1", "TAKE PROFIT 1", "TARGET 1"):
+            elif key in (
+                "TP1", "TAKE PROFIT 1", "TARGET 1",
+            ):
                 analysis.take_profit_1 = value
-            elif key in ("TP2", "TAKE PROFIT 2", "TARGET 2"):
+            elif key in (
+                "TP2", "TAKE PROFIT 2", "TARGET 2",
+            ):
                 analysis.take_profit_2 = value
             elif key in (
-                "RISK", "RISK NOTE", "RISK ASSESSMENT"
+                "RISK", "RISK NOTE", "RISK ASSESSMENT",
             ):
                 analysis.risk_note = value
             elif key in (
@@ -827,7 +872,8 @@ class GeminiAnalyzer:
 
         patterns = {
             "bias": (
-                r"(?:BIAS|MARKET\s*BIAS)\s*[:=]\s*(.+?)(?:\n|$)"
+                r"(?:BIAS|MARKET\s*BIAS)"
+                r"\s*[:=]\s*(.+?)(?:\n|$)"
             ),
             "trade_idea": (
                 r"(?:TRADE|TRADE\s*IDEA|ACTION|SIGNAL)"
@@ -838,14 +884,17 @@ class GeminiAnalyzer:
                 r"\s*[:=]\s*(.+?)(?:\n|$)"
             ),
             "stop_loss": (
-                r"(?:STOP[\s_]*LOSS|SL)\s*[:=]\s*(.+?)(?:\n|$)"
+                r"(?:STOP[\s_]*LOSS|SL)"
+                r"\s*[:=]\s*(.+?)(?:\n|$)"
             ),
             "take_profit_1": (
-                r"(?:TP1|TAKE[\s_]*PROFIT[\s_]*1|TARGET[\s_]*1)"
+                r"(?:TP1|TAKE[\s_]*PROFIT[\s_]*1"
+                r"|TARGET[\s_]*1)"
                 r"\s*[:=]\s*(.+?)(?:\n|$)"
             ),
             "take_profit_2": (
-                r"(?:TP2|TAKE[\s_]*PROFIT[\s_]*2|TARGET[\s_]*2)"
+                r"(?:TP2|TAKE[\s_]*PROFIT[\s_]*2"
+                r"|TARGET[\s_]*2)"
                 r"\s*[:=]\s*(.+?)(?:\n|$)"
             ),
             "risk_note": (
@@ -853,13 +902,16 @@ class GeminiAnalyzer:
                 r"\s*[:=]\s*(.+?)(?:\n|$)"
             ),
             "short_term_outlook": (
-                r"(?:OUTLOOK|SHORT[\s\-_]*TERM[\s_]*OUTLOOK)"
+                r"(?:OUTLOOK|SHORT[\s\-_]*TERM"
+                r"[\s_]*OUTLOOK)"
                 r"\s*[:=]\s*(.+?)(?:\n|$)"
             ),
         }
 
         for field_name, pattern in patterns.items():
-            match = re.search(pattern, text_clean, re.IGNORECASE)
+            match = re.search(
+                pattern, text_clean, re.IGNORECASE
+            )
             if match:
                 value = match.group(1).strip()
                 if value and value != "N/A":
@@ -877,7 +929,8 @@ class GeminiAnalyzer:
         df: pd.DataFrame,
     ) -> AIAnalysis:
         logger.warning(
-            "Using indicator-based fallback (Gemini unavailable)"
+            "Using indicator-based fallback "
+            "(Gemini unavailable)"
         )
         analysis = AIAnalysis()
         latest_close = df.iloc[-1]["close"]
@@ -925,7 +978,9 @@ class GeminiAnalyzer:
             analysis.bias = "Neutral (Indicator-Based)"
             analysis.trade_idea = "Wait"
             analysis.entry = "Wait for clearer signal"
-            analysis.stop_loss = f"{indicators.support:.2f}"
+            analysis.stop_loss = (
+                f"{indicators.support:.2f}"
+            )
             analysis.take_profit_1 = (
                 f"{indicators.resistance:.2f}"
             )
@@ -936,7 +991,8 @@ class GeminiAnalyzer:
         analysis.risk_note = (
             f"ATR-based volatility: "
             f"{indicators.volatility_condition}. "
-            f"AI service unavailable - using indicator fallback."
+            f"AI service unavailable - "
+            f"using indicator fallback."
         )
         analysis.short_term_outlook = (
             f"RSI at {indicators.rsi:.1f} "
@@ -946,7 +1002,8 @@ class GeminiAnalyzer:
             f"resistance at {indicators.resistance:.2f}."
         )
         analysis.raw_response = (
-            "[Fallback: Generated from technical indicators]"
+            "[Fallback: Generated from "
+            "technical indicators]"
         )
         return analysis
 
@@ -955,7 +1012,7 @@ gemini_analyzer = GeminiAnalyzer(GEMINI_API_KEY)
 
 
 # =============================================================================
-# MODULE 4: CHART GENERATOR (PURELY SYNCHRONOUS — NO ASYNCIO)
+# MODULE 4: CHART GENERATOR (PURELY SYNCHRONOUS)
 # =============================================================================
 class ChartGenerator:
 
@@ -973,10 +1030,11 @@ class ChartGenerator:
             plot_df = df.tail(60).copy()
 
             fig, axes = plt.subplots(
-                3,
-                1,
+                3, 1,
                 figsize=CHART_FIGSIZE,
-                gridspec_kw={"height_ratios": [3, 1, 1]},
+                gridspec_kw={
+                    "height_ratios": [3, 1, 1]
+                },
                 sharex=True,
             )
             fig.suptitle(
@@ -987,7 +1045,6 @@ class ChartGenerator:
                 y=0.98,
             )
 
-            # Panel 1: Price + EMAs + S/R
             ax1 = axes[0]
             ax1.plot(
                 plot_df["datetime"],
@@ -1014,17 +1071,14 @@ class ChartGenerator:
                 ax1.plot(
                     [row["datetime"], row["datetime"]],
                     [row["low"], row["high"]],
-                    color=clr,
-                    linewidth=0.8,
-                    alpha=0.6,
+                    color=clr, linewidth=0.8, alpha=0.6,
                 )
                 body_lo = min(row["open"], row["close"])
                 body_hi = max(row["open"], row["close"])
                 ax1.plot(
                     [row["datetime"], row["datetime"]],
                     [body_lo, body_hi],
-                    color=clr,
-                    linewidth=2.5,
+                    color=clr, linewidth=2.5,
                 )
 
             if "ema_20" in plot_df.columns:
@@ -1032,9 +1086,11 @@ class ChartGenerator:
                     plot_df["datetime"],
                     plot_df["ema_20"],
                     color=COLOR_BLUE,
-                    linewidth=1.2,
-                    linestyle="--",
-                    label=f"EMA 20 ({indicators.ema_20:.2f})",
+                    linewidth=1.2, linestyle="--",
+                    label=(
+                        f"EMA 20 "
+                        f"({indicators.ema_20:.2f})"
+                    ),
                     alpha=0.9,
                 )
             if "ema_50" in plot_df.columns:
@@ -1042,38 +1098,43 @@ class ChartGenerator:
                     plot_df["datetime"],
                     plot_df["ema_50"],
                     color=COLOR_ORANGE,
-                    linewidth=1.2,
-                    linestyle="--",
-                    label=f"EMA 50 ({indicators.ema_50:.2f})",
+                    linewidth=1.2, linestyle="--",
+                    label=(
+                        f"EMA 50 "
+                        f"({indicators.ema_50:.2f})"
+                    ),
                     alpha=0.9,
                 )
 
             ax1.axhline(
                 y=indicators.support,
                 color=COLOR_GREEN_BRIGHT,
-                linestyle=":",
-                linewidth=1.0,
-                alpha=0.8,
-                label=f"Support ({indicators.support:.2f})",
+                linestyle=":", linewidth=1.0, alpha=0.8,
+                label=(
+                    f"Support "
+                    f"({indicators.support:.2f})"
+                ),
             )
             ax1.axhline(
                 y=indicators.resistance,
                 color=COLOR_RED_BRIGHT,
-                linestyle=":",
-                linewidth=1.0,
-                alpha=0.8,
-                label=f"Resistance ({indicators.resistance:.2f})",
+                linestyle=":", linewidth=1.0, alpha=0.8,
+                label=(
+                    f"Resistance "
+                    f"({indicators.resistance:.2f})"
+                ),
             )
 
             ax1.set_ylabel(
-                "Price (USD)", fontsize=10, color=COLOR_WHITE
+                "Price (USD)",
+                fontsize=10, color=COLOR_WHITE,
             )
             ax1.legend(
-                loc="upper left", fontsize=8, framealpha=0.3
+                loc="upper left",
+                fontsize=8, framealpha=0.3,
             )
             ax1.grid(True, alpha=0.15)
 
-            # Panel 2: RSI
             ax2 = axes[1]
             if "rsi" in plot_df.columns:
                 ax2.plot(
@@ -1081,71 +1142,61 @@ class ChartGenerator:
                     plot_df["rsi"],
                     color=COLOR_PURPLE,
                     linewidth=1.5,
-                    label=f"RSI ({indicators.rsi:.1f})",
+                    label=(
+                        f"RSI ({indicators.rsi:.1f})"
+                    ),
                 )
                 ax2.fill_between(
                     plot_df["datetime"],
-                    plot_df["rsi"],
-                    50,
+                    plot_df["rsi"], 50,
                     where=(plot_df["rsi"] >= 50),
-                    alpha=0.2,
-                    color=COLOR_GREEN,
+                    alpha=0.2, color=COLOR_GREEN,
                 )
                 ax2.fill_between(
                     plot_df["datetime"],
-                    plot_df["rsi"],
-                    50,
+                    plot_df["rsi"], 50,
                     where=(plot_df["rsi"] < 50),
-                    alpha=0.2,
-                    color=COLOR_RED,
+                    alpha=0.2, color=COLOR_RED,
                 )
                 ax2.axhline(
-                    y=70,
-                    color=COLOR_RED_BRIGHT,
+                    y=70, color=COLOR_RED_BRIGHT,
                     linestyle="--",
-                    linewidth=0.8,
-                    alpha=0.6,
+                    linewidth=0.8, alpha=0.6,
                 )
                 ax2.axhline(
-                    y=30,
-                    color=COLOR_GREEN_BRIGHT,
+                    y=30, color=COLOR_GREEN_BRIGHT,
                     linestyle="--",
-                    linewidth=0.8,
-                    alpha=0.6,
+                    linewidth=0.8, alpha=0.6,
                 )
                 ax2.axhline(
-                    y=50,
-                    color=COLOR_GRAY,
+                    y=50, color=COLOR_GRAY,
                     linestyle="-",
-                    linewidth=0.5,
-                    alpha=0.4,
+                    linewidth=0.5, alpha=0.4,
                 )
 
             ax2.set_ylabel(
-                "RSI", fontsize=10, color=COLOR_WHITE
+                "RSI", fontsize=10, color=COLOR_WHITE,
             )
             ax2.set_ylim(10, 90)
             ax2.legend(
-                loc="upper left", fontsize=8, framealpha=0.3
+                loc="upper left",
+                fontsize=8, framealpha=0.3,
             )
             ax2.grid(True, alpha=0.15)
 
-            # Panel 3: MACD
             ax3 = axes[2]
             if "macd_line" in plot_df.columns:
                 ax3.plot(
                     plot_df["datetime"],
                     plot_df["macd_line"],
                     color=COLOR_BLUE,
-                    linewidth=1.2,
-                    label="MACD",
+                    linewidth=1.2, label="MACD",
                 )
                 ax3.plot(
                     plot_df["datetime"],
                     plot_df["macd_signal"],
                     color=COLOR_ORANGE,
-                    linewidth=1.2,
-                    label="Signal",
+                    linewidth=1.2, label="Signal",
                 )
 
                 hist_colors = [
@@ -1156,22 +1207,20 @@ class ChartGenerator:
                     plot_df["datetime"],
                     plot_df["macd_histogram"],
                     color=hist_colors,
-                    alpha=0.5,
-                    width=0.6,
+                    alpha=0.5, width=0.6,
                 )
                 ax3.axhline(
-                    y=0,
-                    color=COLOR_GRAY,
+                    y=0, color=COLOR_GRAY,
                     linestyle="-",
-                    linewidth=0.5,
-                    alpha=0.4,
+                    linewidth=0.5, alpha=0.4,
                 )
 
             ax3.set_ylabel(
-                "MACD", fontsize=10, color=COLOR_WHITE
+                "MACD", fontsize=10, color=COLOR_WHITE,
             )
             ax3.legend(
-                loc="upper left", fontsize=8, framealpha=0.3
+                loc="upper left",
+                fontsize=8, framealpha=0.3,
             )
             ax3.grid(True, alpha=0.15)
 
@@ -1180,28 +1229,22 @@ class ChartGenerator:
             )
             plt.xticks(rotation=45, fontsize=8)
 
-            now_str = datetime.now(timezone.utc).strftime(
-                "%Y-%m-%d %H:%M UTC"
-            )
+            now_str = datetime.now(
+                timezone.utc
+            ).strftime("%Y-%m-%d %H:%M UTC")
             fig.text(
-                0.99,
-                0.01,
+                0.99, 0.01,
                 f"Generated: {now_str}",
-                ha="right",
-                va="bottom",
-                fontsize=7,
-                color=COLOR_GRAY,
-                alpha=0.6,
+                ha="right", va="bottom",
+                fontsize=7, color=COLOR_GRAY, alpha=0.6,
             )
 
             plt.tight_layout()
 
             buf = io.BytesIO()
             fig.savefig(
-                buf,
-                format="png",
-                dpi=CHART_DPI,
-                bbox_inches="tight",
+                buf, format="png",
+                dpi=CHART_DPI, bbox_inches="tight",
                 facecolor=fig.get_facecolor(),
                 edgecolor="none",
             )
@@ -1212,7 +1255,9 @@ class ChartGenerator:
             return buf
 
         except Exception as exc:
-            logger.error(f"Chart generation error: {exc}")
+            logger.error(
+                f"Chart generation error: {exc}"
+            )
             plt.close("all")
             return None
 
@@ -1241,7 +1286,6 @@ async def cmd_start(
     role = user_data["role"]
     limit = user_data["daily_limit"]
 
-    # Auto-set owner role on first interaction
     if user.id == OWNER_ID and role != "owner":
         await db.set_role(user.id, "owner", 999999)
         role = "owner"
@@ -1252,11 +1296,26 @@ async def cmd_start(
         role_line = "👑 Role: <b>Owner</b> (Unlimited)"
     elif role == "premium":
         role_line = (
-            f"💎 Role: <b>Premium</b> ({limit} cmds/day)"
+            f"💎 Role: <b>Premium</b> "
+            f"({limit} cmds/day)"
         )
     else:
         role_line = (
-            f"🆓 Role: <b>Free</b> ({limit} cmds/day)"
+            f"🆓 Role: <b>Free</b> "
+            f"({limit} cmds/day)"
+        )
+
+    # Build owner contact link for free users
+    owner_link = (
+        f"https://t.me/{OWNER_USERNAME.lstrip('@')}"
+    )
+
+    upgrade_hint = ""
+    if role == "free":
+        upgrade_hint = (
+            "\n"
+            "💡 Want more credits? Use /upgrade to learn "
+            "about Premium!\n"
         )
 
     welcome = (
@@ -1264,12 +1323,15 @@ async def cmd_start(
         "━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
         "\n"
         "Welcome! I provide real-time AI-powered "
-        "technical analysis for <b>Gold (XAU/USD)</b>.\n"
+        "technical analysis for "
+        "<b>Gold (XAU/USD)</b>.\n"
         "\n"
         f"{role_line}\n"
+        f"{upgrade_hint}"
         "\n"
         "🔹 Real-time price data from Twelve Data\n"
-        "🔹 Technical indicators (RSI, EMA, MACD, ATR)\n"
+        "🔹 Technical indicators "
+        "(RSI, EMA, MACD, ATR)\n"
         "🔹 AI analysis powered by Google Gemini\n"
         "🔹 Professional chart generation\n"
         "\n"
@@ -1280,6 +1342,8 @@ async def cmd_start(
         "/timeframe - Change timeframe "
         "(e.g. <code>/timeframe 1h</code>)\n"
         "/credits - Check remaining credits\n"
+        "/checkid - View your account info\n"
+        "/upgrade - Premium upgrade info\n"
         "/help - Show all commands\n"
         "\n"
         "Default timeframe: <b>15 Min</b>\n"
@@ -1288,7 +1352,9 @@ async def cmd_start(
         "Trade responsibly.</i>"
     )
     await update.message.reply_text(
-        welcome, parse_mode=ParseMode.HTML
+        welcome,
+        parse_mode=ParseMode.HTML,
+        disable_web_page_preview=True,
     )
     logger.info(
         f"User {user.id} started the bot (role={role})"
@@ -1302,12 +1368,22 @@ async def cmd_help(
         "🔹 <b>Bot Commands</b>\n"
         "━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
         "\n"
-        "/start - Welcome message\n"
+        "<b>📊 Analysis Commands:</b>\n"
         "/price - Latest XAU/USD price (1 credit)\n"
-        "/analysis - Full AI technical analysis (1 credit)\n"
+        "/analysis - Full AI technical analysis "
+        "(1 credit)\n"
         "/chart - Send technical chart (1 credit)\n"
-        "/timeframe &lt;tf&gt; - Change timeframe (free)\n"
+        "\n"
+        "<b>⚙️ Settings:</b>\n"
+        "/timeframe &lt;tf&gt; - Change timeframe "
+        "(free)\n"
+        "\n"
+        "<b>👤 Account:</b>\n"
         "/credits - Check remaining daily credits\n"
+        "/checkid - View your Telegram ID &amp; "
+        "account info\n"
+        "/upgrade - Premium upgrade info &amp; "
+        "pricing\n"
         "\n"
         "<b>Timeframe Options:</b>\n"
         "  <code>5m</code>  - 5 Minutes\n"
@@ -1318,6 +1394,7 @@ async def cmd_help(
         "\n"
         "<b>Example:</b> <code>/timeframe 4h</code>\n"
         "\n"
+        "/start - Welcome message\n"
         "/help - This message\n"
         "━━━━━━━━━━━━━━━━━━━━━━━━━━━"
     )
@@ -1329,7 +1406,6 @@ async def cmd_help(
 async def cmd_credits(
     update: Update, context: ContextTypes.DEFAULT_TYPE
 ) -> None:
-    """Show the user their remaining credits for the day."""
     user = update.effective_user
     user_data = await db.get_or_create_user(
         user.id, user.username
@@ -1364,12 +1440,22 @@ async def cmd_credits(
             "━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
             "\n"
             f"Role: <b>{h(role_name)}</b>\n"
-            f"Used Today: <code>{used}/{limit}</code>\n"
+            f"Used Today: "
+            f"<code>{used}/{limit}</code>\n"
             f"Remaining: <b>{remaining}</b>\n"
             "\n"
-            "Resets daily at <code>00:00 UTC</code>\n"
-            "━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+            "Resets daily at "
+            "<code>00:00 UTC</code>\n"
         )
+
+        if role == "free":
+            msg += (
+                "\n"
+                "💡 Need more? Use /upgrade to learn "
+                "about Premium!\n"
+            )
+
+        msg += "━━━━━━━━━━━━━━━━━━━━━━━━━━━"
 
     await update.message.reply_text(
         msg, parse_mode=ParseMode.HTML
@@ -1391,7 +1477,6 @@ async def cmd_price(
             None, td_client.fetch_current_price
         )
 
-        # Track API usage AFTER executor returns (in async context)
         await db.increment_api_counter("twelvedata_calls")
 
         if price_data is None:
@@ -1408,8 +1493,10 @@ async def cmd_price(
             "🥇 <b>XAU/USD - Live Price</b>\n"
             "━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
             "\n"
-            f"💰 <b>Price:</b> <code>${price:,.2f}</code>\n"
-            f"🕐 <b>Time:</b>  <code>{timestamp}</code>\n"
+            f"💰 <b>Price:</b> "
+            f"<code>${price:,.2f}</code>\n"
+            f"🕐 <b>Time:</b>  "
+            f"<code>{timestamp}</code>\n"
             "\n"
             "━━━━━━━━━━━━━━━━━━━━━━━━━━━"
         )
@@ -1417,8 +1504,8 @@ async def cmd_price(
             msg, parse_mode=ParseMode.HTML
         )
         logger.info(
-            f"Price sent to user {update.effective_user.id}: "
-            f"${price:.2f}"
+            f"Price sent to user "
+            f"{update.effective_user.id}: ${price:.2f}"
         )
 
     except Exception as exc:
@@ -1442,7 +1529,6 @@ async def cmd_analysis(
     )
 
     try:
-        # Step 1: Fetch market data
         await twelvedata_limiter.acquire()
         loop = asyncio.get_running_loop()
         df = await loop.run_in_executor(
@@ -1452,7 +1538,6 @@ async def cmd_analysis(
             DEFAULT_OUTPUTSIZE,
         )
 
-        # Track TwelveData usage AFTER executor returns
         await db.increment_api_counter("twelvedata_calls")
 
         if df is None or len(df) < 50:
@@ -1462,11 +1547,9 @@ async def cmd_analysis(
             )
             return
 
-        # Step 2: Calculate indicators
         df, indicators = ta_engine.compute_indicators(df)
         latest = df.iloc[-1]
 
-        # Step 3: AI analysis
         ai_result = await loop.run_in_executor(
             None,
             gemini_analyzer.generate_analysis,
@@ -1475,10 +1558,8 @@ async def cmd_analysis(
             tf.display_name,
         )
 
-        # Track Gemini usage AFTER executor returns
         await db.increment_api_counter("gemini_calls")
 
-        # Step 4: Format and send (HTML — safe from parse errors)
         tf_name = h(tf.display_name)
         rsi_interp = h(indicators.rsi_interpretation)
         ema_trend = h(indicators.ema_trend)
@@ -1499,30 +1580,43 @@ async def cmd_analysis(
         )
 
         msg = (
-            f"🥇 <b>XAU/USD Analysis ({tf_name})</b>\n"
+            f"🥇 <b>XAU/USD Analysis "
+            f"({tf_name})</b>\n"
             "━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
             "\n"
             "📊 <b>PRICE ACTION</b>\n"
-            f"Price: <code>${latest['close']:,.2f}</code>\n"
-            f"Open: <code>${latest['open']:,.2f}</code>\n"
-            f"High: <code>${latest['high']:,.2f}</code>\n"
-            f"Low:  <code>${latest['low']:,.2f}</code>\n"
+            f"Price: "
+            f"<code>${latest['close']:,.2f}</code>\n"
+            f"Open: "
+            f"<code>${latest['open']:,.2f}</code>\n"
+            f"High: "
+            f"<code>${latest['high']:,.2f}</code>\n"
+            f"Low:  "
+            f"<code>${latest['low']:,.2f}</code>\n"
             "\n"
             "📈 <b>TECHNICAL INDICATORS</b>\n"
-            f"RSI (14):  <code>{indicators.rsi}</code>"
+            f"RSI (14):  "
+            f"<code>{indicators.rsi}</code>"
             f" - {rsi_interp}\n"
-            f"EMA 20:    <code>{indicators.ema_20}</code>\n"
-            f"EMA 50:    <code>{indicators.ema_50}</code>\n"
+            f"EMA 20:    "
+            f"<code>{indicators.ema_20}</code>\n"
+            f"EMA 50:    "
+            f"<code>{indicators.ema_50}</code>\n"
             f"EMA Trend: {ema_trend}\n"
             f"MACD:      {macd_interp}\n"
-            f"ATR (14):  <code>{indicators.atr}</code>\n"
+            f"ATR (14):  "
+            f"<code>{indicators.atr}</code>\n"
             f"Volatility: {vol_cond}\n"
             "\n"
             "🛡 <b>KEY LEVELS</b>\n"
             f"Support:    "
-            f"<code>${indicators.support:,.2f}</code>\n"
+            f"<code>"
+            f"${indicators.support:,.2f}"
+            f"</code>\n"
             f"Resistance: "
-            f"<code>${indicators.resistance:,.2f}</code>\n"
+            f"<code>"
+            f"${indicators.resistance:,.2f}"
+            f"</code>\n"
             "\n"
             "🤖 <b>AI ANALYSIS</b>\n"
             f"Bias:     {ai_bias}\n"
@@ -1550,7 +1644,8 @@ async def cmd_analysis(
 
     except Exception as exc:
         logger.error(
-            f"Analysis command error: {exc}", exc_info=True
+            f"Analysis command error: {exc}",
+            exc_info=True,
         )
         await loading_msg.edit_text(
             "An error occurred during analysis. "
@@ -1580,7 +1675,6 @@ async def cmd_chart(
             DEFAULT_OUTPUTSIZE,
         )
 
-        # Track API usage AFTER executor returns
         await db.increment_api_counter("twelvedata_calls")
 
         if df is None or len(df) < 20:
@@ -1610,8 +1704,10 @@ async def cmd_chart(
         )
         caption = (
             f"XAU/USD - {tf.display_name} Chart\n"
-            f"Price: ${df.iloc[-1]['close']:,.2f}\n"
-            f"RSI: {indicators.rsi} | ATR: {indicators.atr}\n"
+            f"Price: "
+            f"${df.iloc[-1]['close']:,.2f}\n"
+            f"RSI: {indicators.rsi} | "
+            f"ATR: {indicators.atr}\n"
             f"{now_str}"
         )
 
@@ -1620,15 +1716,18 @@ async def cmd_chart(
             photo=chart_buf, caption=caption
         )
         logger.info(
-            f"Chart sent to user {update.effective_user.id}"
+            f"Chart sent to user "
+            f"{update.effective_user.id}"
         )
 
     except Exception as exc:
         logger.error(
-            f"Chart command error: {exc}", exc_info=True
+            f"Chart command error: {exc}",
+            exc_info=True,
         )
         await loading_msg.edit_text(
-            "An error occurred while generating the chart."
+            "An error occurred while generating "
+            "the chart."
         )
 
 
@@ -1643,8 +1742,8 @@ async def cmd_timeframe(
             f"Current Timeframe: "
             f"<b>{h(current_tf)}</b>\n"
             "\n"
-            "<b>Usage:</b> <code>/timeframe &lt;option&gt;"
-            "</code>\n"
+            "<b>Usage:</b> "
+            "<code>/timeframe &lt;option&gt;</code>\n"
             "\n"
             "<b>Options:</b>\n"
             "  <code>5m</code>  - 5 Minutes\n"
@@ -1653,7 +1752,8 @@ async def cmd_timeframe(
             "  <code>4h</code>  - 4 Hours\n"
             "  <code>1d</code>  - Daily\n"
             "\n"
-            "<b>Example:</b> <code>/timeframe 4h</code>"
+            "<b>Example:</b> "
+            "<code>/timeframe 4h</code>"
         )
         await update.message.reply_text(
             msg, parse_mode=ParseMode.HTML
@@ -1682,8 +1782,8 @@ async def cmd_timeframe(
         parse_mode=ParseMode.HTML,
     )
     logger.info(
-        f"User {update.effective_user.id} changed timeframe "
-        f"to {new_tf.value}"
+        f"User {update.effective_user.id} changed "
+        f"timeframe to {new_tf.value}"
     )
 
 
@@ -1711,24 +1811,32 @@ async def error_handler(
 # MODULE 7: MAIN ENTRY POINT
 # =============================================================================
 async def post_init(application: Application) -> None:
-    """Called after Application.initialize() — DB + owner setup."""
+    """Called after Application.initialize()."""
     await db.init_pool()
     logger.info("Database pool initialised in post_init")
 
-    # Auto-register owner
     await db.get_or_create_user(OWNER_ID, "EK_HENG")
     await db.set_role(OWNER_ID, "owner", 999999)
     logger.info(
-        f"Owner {OWNER_ID} registered with unlimited access"
+        f"Owner {OWNER_ID} registered "
+        f"with unlimited access"
     )
 
     commands = [
         BotCommand("start", "Welcome message"),
         BotCommand("price", "Latest XAU/USD price"),
-        BotCommand("analysis", "Full AI technical analysis"),
+        BotCommand(
+            "analysis", "Full AI technical analysis"
+        ),
         BotCommand("chart", "Technical analysis chart"),
         BotCommand("timeframe", "Change timeframe"),
         BotCommand("credits", "Check remaining credits"),
+        BotCommand(
+            "checkid", "View your ID & account info"
+        ),
+        BotCommand(
+            "upgrade", "Premium upgrade info"
+        ),
         BotCommand("help", "Show all commands"),
     ]
     await application.bot.set_my_commands(commands)
@@ -1743,12 +1851,14 @@ async def post_shutdown(application: Application) -> None:
 
 def main() -> None:
     logger.info("=" * 60)
-    logger.info("  XAUUSD AI ANALYSIS BOT v3.1 - Starting...")
+    logger.info(
+        "  XAUUSD AI ANALYSIS BOT v3.2 - Starting..."
+    )
     logger.info("  Parse Mode: HTML (crash-proof)")
-    logger.info("  SDK: google-genai (new)")
+    logger.info("  SDK: google-genai")
     logger.info("  Database: PostgreSQL (Railway)")
     logger.info("  Credit System: ACTIVE")
-    logger.info("  Python 3.13 Compatible: YES")
+    logger.info("  New: /checkid, /upgrade commands")
     logger.info("=" * 60)
 
     app = (
@@ -1762,24 +1872,58 @@ def main() -> None:
         .build()
     )
 
-    # User commands
+    # ── User commands ─────────────────────────────────
     app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(CommandHandler("help", cmd_help))
-    app.add_handler(CommandHandler("credits", cmd_credits))
+    app.add_handler(
+        CommandHandler("credits", cmd_credits)
+    )
     app.add_handler(CommandHandler("price", cmd_price))
-    app.add_handler(CommandHandler("analysis", cmd_analysis))
+    app.add_handler(
+        CommandHandler("analysis", cmd_analysis)
+    )
     app.add_handler(CommandHandler("chart", cmd_chart))
-    app.add_handler(CommandHandler("timeframe", cmd_timeframe))
+    app.add_handler(
+        CommandHandler("timeframe", cmd_timeframe)
+    )
 
-    # Admin commands (owner only)
+    # ── Account commands (any user) ───────────────────
     app.add_handler(
-        CommandHandler("addprem", admin_commands.cmd_addprem)
+        CommandHandler(
+            "checkid", admin_commands.cmd_checkid
+        )
     )
     app.add_handler(
-        CommandHandler("addpremium", admin_commands.cmd_addprem)
+        CommandHandler(
+            "upgrade", admin_commands.cmd_upgrade
+        )
     )
     app.add_handler(
-        CommandHandler("delprem", admin_commands.cmd_delprem)
+        CommandHandler(
+            "premium", admin_commands.cmd_upgrade
+        )
+    )
+    app.add_handler(
+        CommandHandler(
+            "buypremium", admin_commands.cmd_upgrade
+        )
+    )
+
+    # ── Admin commands (owner only) ───────────────────
+    app.add_handler(
+        CommandHandler(
+            "addprem", admin_commands.cmd_addprem
+        )
+    )
+    app.add_handler(
+        CommandHandler(
+            "addpremium", admin_commands.cmd_addprem
+        )
+    )
+    app.add_handler(
+        CommandHandler(
+            "delprem", admin_commands.cmd_delprem
+        )
     )
     app.add_handler(
         CommandHandler(
@@ -1787,14 +1931,17 @@ def main() -> None:
         )
     )
     app.add_handler(
-        CommandHandler("botstats", admin_commands.cmd_botstats)
+        CommandHandler(
+            "botstats", admin_commands.cmd_botstats
+        )
     )
 
-    # Error handler
+    # ── Error handler ─────────────────────────────────
     app.add_error_handler(error_handler)
 
     logger.info(
-        "Bot polling for updates... Press Ctrl+C to stop."
+        "Bot polling for updates... "
+        "Press Ctrl+C to stop."
     )
     app.run_polling(
         allowed_updates=Update.ALL_TYPES,
