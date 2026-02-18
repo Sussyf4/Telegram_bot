@@ -70,7 +70,7 @@ if _missing:
 # =============================================================================
 logging.basicConfig(
     format="%(asctime)s | %(name)-20s | %(levelname)-8s | %(message)s",
-    datefmt enc="%Y-%m-%d %H:%M:%S",
+    datefmt="%Y-%m-%d %H:%M:%S",
     level=logging.INFO,
 )
 logging.getLogger("httpx").setLevel(logging.WARNING)
