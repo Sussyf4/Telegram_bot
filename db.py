@@ -5,12 +5,13 @@
 ║                                                                    ║
 ║  Async PostgreSQL connection pool using asyncpg.                   ║
 ║  Handles: user CRUD, credit tracking, stats, daily resets.         ║
+║  FIXED: Clean async patterns, Python 3.13 compatible.              ║
 ╚══════════════════════════════════════════════════════════════════════╝
 """
 
 import os
 import logging
-from datetime import date, datetime, timezone
+from datetime import date
 from typing import Optional
 
 import asyncpg
@@ -41,7 +42,7 @@ CREATE TABLE IF NOT EXISTS users (
 
 CREATE_API_STATS_TABLE_SQL = """
 CREATE TABLE IF NOT EXISTS api_stats (
-    stat_date       DATE PRIMARY KEY DEFAULT CURRENT_DATE,
+    stat_date        DATE PRIMARY KEY DEFAULT CURRENT_DATE,
     twelvedata_calls INTEGER NOT NULL DEFAULT 0,
     gemini_calls     INTEGER NOT NULL DEFAULT 0,
     total_commands   INTEGER NOT NULL DEFAULT 0
@@ -119,20 +120,20 @@ async def get_or_create_user(
             )
 
             if row is not None:
-                # Update username if it changed
                 if username and row["username"] != username:
                     await conn.execute(
-                        "UPDATE users SET username = $1 WHERE user_id = $2",
+                        "UPDATE users SET username = $1 "
+                        "WHERE user_id = $2",
                         username,
                         user_id,
                     )
                 return dict(row)
 
-            # New user — insert as free
             await conn.execute(
                 """
-                INSERT INTO users (user_id, username, role, daily_used,
-                                   daily_limit, last_reset)
+                INSERT INTO users
+                    (user_id, username, role, daily_used,
+                     daily_limit, last_reset)
                 VALUES ($1, $2, 'free', 0, 5, CURRENT_DATE)
                 """,
                 user_id,
@@ -155,7 +156,7 @@ async def reset_daily_if_needed(user_id: int) -> dict:
     daily_used and stamp today.  Returns the (possibly updated) row.
     """
     pool = get_pool()
-    today = date.today()  # server should run in UTC
+    today = date.today()
 
     async with pool.acquire() as conn:
         async with conn.transaction():
@@ -191,7 +192,8 @@ async def increment_usage(user_id: int) -> None:
     """Atomically bump daily_used by 1."""
     pool = get_pool()
     await pool.execute(
-        "UPDATE users SET daily_used = daily_used + 1 WHERE user_id = $1",
+        "UPDATE users SET daily_used = daily_used + 1 "
+        "WHERE user_id = $1",
         user_id,
     )
 
@@ -222,7 +224,6 @@ async def set_role(
             daily_limit,
             user_id,
         )
-        # result looks like "UPDATE 1" or "UPDATE 0"
         return result.endswith("1")
 
 
@@ -299,7 +300,6 @@ async def increment_api_counter(
     pool = get_pool()
     today = date.today()
 
-    # Upsert
     await pool.execute(
         f"""
         INSERT INTO api_stats (stat_date, {column})
