@@ -4,11 +4,13 @@
 ║                      CREDIT MANAGER                                ║
 ║                                                                    ║
 ║  Provides the @require_credit decorator and credit helpers.        ║
+║  FIXED: HTML parse mode, clean async, Python 3.13 compatible.      ║
 ╚══════════════════════════════════════════════════════════════════════╝
 """
 
 import functools
 import logging
+from html import escape as html_escape
 from typing import Callable, Awaitable
 
 from telegram import Update
@@ -37,19 +39,15 @@ async def check_and_deduct(
     username: str | None = None,
 ) -> tuple[bool, str]:
     """
-    Returns (allowed: bool, message: str).
+    Returns (allowed: bool, deny_message_html: str).
 
-    * Owner → always allowed, no deduction.
-    * Others → daily reset check, limit check, then deduct.
+    Owner -> always allowed, no deduction.
+    Others -> daily reset check, limit check, then deduct.
     """
-    # Owner bypass
     if user_id == OWNER_ID:
         return True, ""
 
-    # Ensure user exists
     user = await db.get_or_create_user(user_id, username)
-
-    # Daily reset
     user = await db.reset_daily_if_needed(user_id)
 
     role = user["role"]
@@ -59,22 +57,23 @@ async def check_and_deduct(
     if used >= limit:
         if role == "free":
             msg = (
-                "🚫 *Daily limit reached*\n\n"
-                f"Free users get *{FREE_DAILY_LIMIT}* commands/day\\.\n"
-                f"You've used *{used}/{limit}*\\.\n\n"
-                "Resets at `00:00 UTC`\\.\n"
-                "Contact the owner to upgrade to Premium\\!"
+                "🚫 <b>Daily limit reached</b>\n\n"
+                f"Free users get <b>{FREE_DAILY_LIMIT}</b> "
+                f"commands/day.\n"
+                f"You've used <b>{used}/{limit}</b>.\n\n"
+                "Resets at <code>00:00 UTC</code>.\n"
+                "Contact the owner to upgrade to Premium!"
             )
         else:
             msg = (
-                "🚫 *Daily limit reached*\n\n"
-                f"Premium users get *{PREMIUM_DAILY_LIMIT}* commands/day\\.\n"
-                f"You've used *{used}/{limit}*\\.\n\n"
-                "Resets at `00:00 UTC`\\."
+                "🚫 <b>Daily limit reached</b>\n\n"
+                f"Premium users get <b>{PREMIUM_DAILY_LIMIT}</b> "
+                f"commands/day.\n"
+                f"You've used <b>{used}/{limit}</b>.\n\n"
+                "Resets at <code>00:00 UTC</code>."
             )
         return False, msg
 
-    # Deduct
     await db.increment_usage(user_id)
     await db.increment_api_counter("total_commands")
     return True, ""
@@ -88,11 +87,6 @@ def require_credit(
 ) -> Callable[..., Awaitable]:
     """
     Decorator for Telegram command handlers.
-
-    Usage:
-        @require_credit
-        async def cmd_analysis(update, context):
-            ...
 
     Before the wrapped handler executes:
         1. Checks / creates user in DB.
@@ -120,7 +114,7 @@ def require_credit(
 
         if not allowed:
             await update.message.reply_text(
-                deny_msg, parse_mode=ParseMode.MARKDOWN_V2
+                deny_msg, parse_mode=ParseMode.HTML
             )
             logger.info(
                 f"Credit denied for user {user_id} (@{username})"
