@@ -4,11 +4,13 @@
 ║                       ADMIN COMMANDS                               ║
 ║                                                                    ║
 ║  Owner-only handlers: addprem, delprem, botstats                   ║
+║  FIXED: HTML parse mode, no MarkdownV2 crashes.                    ║
 ╚══════════════════════════════════════════════════════════════════════╝
 """
 
 import logging
 from datetime import datetime, timezone
+from html import escape as html_escape
 
 from telegram import Update
 from telegram.ext import ContextTypes
@@ -29,7 +31,7 @@ logger = logging.getLogger("XAUUSD_Bot.admin")
 # Security gate
 # ==========================================================================
 def _owner_only(func):
-    """Silently ignore (or warn) non-owner callers."""
+    """Silently ignore or warn non-owner callers."""
 
     async def wrapper(
         update: Update,
@@ -48,7 +50,6 @@ def _owner_only(func):
             return
         return await func(update, context, *args, **kwargs)
 
-    # Preserve __name__ so CommandHandler registration works
     wrapper.__name__ = func.__name__
     return wrapper
 
@@ -61,9 +62,8 @@ def _parse_target_id(args: list[str]) -> int | None:
     if not args:
         return None
     raw = args[0].strip()
-    # Strip leading @ just in case someone passes a username
     if raw.startswith("@"):
-        return None  # we require numeric IDs
+        return None
     try:
         uid = int(raw)
         if uid <= 0:
@@ -85,9 +85,10 @@ async def cmd_addprem(
 
     if target_id is None:
         await update.message.reply_text(
-            "⚠️ Usage: /addprem <user_id>\n"
+            "⚠️ Usage: /addprem &lt;user_id&gt;\n"
             "Example: /addprem 123456789\n\n"
-            "User ID must be a positive number."
+            "User ID must be a positive number.",
+            parse_mode=ParseMode.HTML,
         )
         return
 
@@ -97,23 +98,24 @@ async def cmd_addprem(
         )
         return
 
-    # Ensure user row exists first
     await db.get_or_create_user(target_id)
-
-    updated = await db.set_role(target_id, "premium", PREMIUM_DAILY_LIMIT)
+    updated = await db.set_role(
+        target_id, "premium", PREMIUM_DAILY_LIMIT
+    )
 
     if updated:
         await update.message.reply_text(
-            f"✅ User `{target_id}` upgraded to *Premium*\\.\n"
-            f"Daily limit: *{PREMIUM_DAILY_LIMIT}* commands/day\\.",
-            parse_mode=ParseMode.MARKDOWN_V2,
+            f"✅ User <code>{target_id}</code> upgraded to "
+            f"<b>Premium</b>.\n"
+            f"Daily limit: <b>{PREMIUM_DAILY_LIMIT}</b> commands/day.",
+            parse_mode=ParseMode.HTML,
         )
         logger.info(f"Owner promoted user {target_id} to premium")
     else:
         await update.message.reply_text(
-            f"⚠️ Could not update user `{target_id}`. "
+            f"⚠️ Could not update user <code>{target_id}</code>. "
             f"They may not exist yet (they need to /start first).",
-            parse_mode=ParseMode.MARKDOWN_V2,
+            parse_mode=ParseMode.HTML,
         )
 
 
@@ -129,9 +131,10 @@ async def cmd_delprem(
 
     if target_id is None:
         await update.message.reply_text(
-            "⚠️ Usage: /delprem <user_id>\n"
+            "⚠️ Usage: /delprem &lt;user_id&gt;\n"
             "Example: /delprem 123456789\n\n"
-            "User ID must be a positive number."
+            "User ID must be a positive number.",
+            parse_mode=ParseMode.HTML,
         )
         return
 
@@ -141,22 +144,23 @@ async def cmd_delprem(
         )
         return
 
-    # Ensure user row exists
     await db.get_or_create_user(target_id)
-
-    updated = await db.set_role(target_id, "free", FREE_DAILY_LIMIT)
+    updated = await db.set_role(
+        target_id, "free", FREE_DAILY_LIMIT
+    )
 
     if updated:
         await update.message.reply_text(
-            f"✅ User `{target_id}` downgraded to *Free*\\.\n"
-            f"Daily limit: *{FREE_DAILY_LIMIT}* commands/day\\.",
-            parse_mode=ParseMode.MARKDOWN_V2,
+            f"✅ User <code>{target_id}</code> downgraded to "
+            f"<b>Free</b>.\n"
+            f"Daily limit: <b>{FREE_DAILY_LIMIT}</b> commands/day.",
+            parse_mode=ParseMode.HTML,
         )
         logger.info(f"Owner demoted user {target_id} to free")
     else:
         await update.message.reply_text(
-            f"⚠️ Could not update user `{target_id}`.",
-            parse_mode=ParseMode.MARKDOWN_V2,
+            f"⚠️ Could not update user <code>{target_id}</code>.",
+            parse_mode=ParseMode.HTML,
         )
 
 
@@ -183,38 +187,37 @@ async def cmd_botstats(
 
         td_calls = api_stats.get("twelvedata_calls", 0)
         gemini_calls = api_stats.get("gemini_calls", 0)
+        total_api = api_stats.get("total_commands", 0)
 
-        now_str = datetime.now(timezone.utc).strftime(
-            "%Y-%m-%d %H:%M UTC"
+        now_str = html_escape(
+            datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
         )
 
         msg = (
-            "📊 *BOT STATS*\n"
+            "📊 <b>BOT STATS</b>\n"
             "━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
             "\n"
-            f"👥 Total Users: `{total}`\n"
-            f"💎 Premium Users: `{premium}`\n"
-            f"🆓 Free Users: `{free}`\n"
+            f"👥 Total Users: <code>{total}</code>\n"
+            f"💎 Premium Users: <code>{premium}</code>\n"
+            f"🆓 Free Users: <code>{free}</code>\n"
             "\n"
             "━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
-            f"📈 Today Commands Used: `{today_cmds}`\n"
+            f"📈 Today Commands Used: <code>{today_cmds}</code>\n"
+            f"📊 Total API Commands: <code>{total_api}</code>\n"
             "\n"
-            "*API Usage Today:*\n"
-            f"  TwelveData Calls: `{td_calls}`\n"
-            f"  Gemini AI Calls:  `{gemini_calls}`\n"
+            "<b>API Usage Today:</b>\n"
+            f"  TwelveData Calls: <code>{td_calls}</code>\n"
+            f"  Gemini AI Calls:  <code>{gemini_calls}</code>\n"
             "\n"
-            "*TwelveData Status:*\n"
-            f"  API Key: `Active`\n"
-            f"  Tracked Calls Today: `{td_calls}`\n"
+            "<b>TwelveData Status:</b>\n"
+            "  API Key: <code>Active</code>\n"
+            f"  Tracked Calls Today: <code>{td_calls}</code>\n"
             "\n"
             "━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
-            f"_Generated: {now_str}_"
+            f"<i>Generated: {now_str}</i>"
         )
 
-        # MarkdownV2 requires escaping
-        # We'll send as plain Markdown (v1) for stats to avoid
-        # escaping headaches with numbers and colons.
-        await loading.edit_text(msg, parse_mode=ParseMode.MARKDOWN)
+        await loading.edit_text(msg, parse_mode=ParseMode.HTML)
         logger.info("Bot stats delivered to owner")
 
     except Exception as e:
