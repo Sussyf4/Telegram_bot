@@ -1,10 +1,11 @@
 #!/usr/bin/env python3
 """
 ╔══════════════════════════════════════════════════════════════════════╗
-║                    XAUUSD AI ANALYSIS BOT v3.0                     ║
+║                    XAUUSD AI ANALYSIS BOT v2.1                     ║
 ║                                                                    ║
-║  Credit system · Role-based access · API key rotation              ║
-║  Uses: google-genai SDK, Twelve Data, python-telegram-bot, asyncpg ║
+║  Production-ready Telegram bot for XAU/USD technical analysis      ║
+║  Uses: google-genai SDK, Twelve Data, python-telegram-bot          ║
+║  Features: Credit system, PostgreSQL, API key rotation             ║
 ╚══════════════════════════════════════════════════════════════════════╝
 """
 
@@ -21,10 +22,9 @@ import traceback
 import functools
 from datetime import datetime, timezone, date
 from typing import Optional, Callable, Any
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from enum import Enum
 
-import asyncpg
 import requests
 import pandas as pd
 import ta
@@ -32,6 +32,8 @@ import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import matplotlib.dates as mdates
+
+import asyncpg
 
 from google import genai
 from google.genai import types
@@ -54,19 +56,14 @@ TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 DATABASE_URL = os.getenv("DATABASE_URL")
 
-# TwelveData key pool — collect every non-empty key
-_td_key_names = [
-    "TWELVEDATA_API_KEY",
-    "TWELVEDATA_API_KEY2",
-    "TWELVEDATA_API_KEY3",
-]
-TWELVEDATA_API_KEYS: list[str] = [
-    os.getenv(name)
-    for name in _td_key_names
-    if os.getenv(name)
-]
+# Twelve Data API keys (rotation pool)
+TWELVEDATA_API_KEYS: list[str] = []
+for env_name in ("TWELVEDATA_API_KEY", "TWELVEDATA_API_KEY2", "TWELVEDATA_API_KEY3"):
+    val = os.getenv(env_name, "").strip()
+    if val:
+        TWELVEDATA_API_KEYS.append(val)
 
-_missing: list[str] = []
+_missing = []
 if not TELEGRAM_BOT_TOKEN:
     _missing.append("TELEGRAM_BOT_TOKEN")
 if not TWELVEDATA_API_KEYS:
@@ -81,15 +78,15 @@ if _missing:
         f"Please set them in your .env file or Railway dashboard."
     )
 
-# Owner constant
-OWNER_USER_ID = 5482019561
+# Owner configuration
+OWNER_TELEGRAM_ID = 5482019561
 OWNER_USERNAME = "EK_HENG"
 
-# Role daily limits
-ROLE_LIMITS: dict[str, Optional[int]] = {
-    "owner": None,    # unlimited
+# Credit limits per role
+CREDIT_LIMITS = {
     "free": 5,
     "premium": 50,
+    "owner": -1,  # unlimited
 }
 
 # =============================================================================
@@ -113,12 +110,11 @@ logger = logging.getLogger("XAUUSD_Bot")
 TWELVEDATA_BASE_URL = "https://api.twelvedata.com"
 SYMBOL = "XAU/USD"
 DEFAULT_OUTPUTSIZE = 100
-GEMINI_MODEL = "gemini-2.5-flash"
+GEMINI_MODEL = "gemini-2.0-flash"
 CHART_STYLE = "dark_background"
 CHART_DPI = 150
 CHART_FIGSIZE = (14, 10)
 
-# Color palette
 COLOR_GREEN = "#26a69a"
 COLOR_RED = "#ef5350"
 COLOR_BLUE = "#2196F3"
@@ -204,383 +200,641 @@ class UserSession:
     last_request_time: float = 0.0
 
 
-# =============================================================================
-# MODULE 1: DATABASE MANAGER (asyncpg + PostgreSQL)
-# =============================================================================
-class DatabaseManager:
-    """Manages the asyncpg connection pool and all user CRUD operations."""
+@dataclass
+class UserRecord:
+    """Represents a row from the users table."""
+    id: int
+    telegram_id: int
+    username: Optional[str]
+    role: str
+    daily_used: int
+    last_reset: date
+    created_at: datetime
 
-    def __init__(self) -> None:
-        self.pool: Optional[asyncpg.Pool] = None
+
+# =============================================================================
+# MODULE 0: CREDIT MANAGER (PostgreSQL + asyncpg)
+# =============================================================================
+class CreditManager:
+    """
+    Manages user credits via PostgreSQL with asyncpg connection pooling.
+    Handles auto-creation, daily resets, and role management.
+    """
+
+    def __init__(self, database_url: str):
+        self._database_url = database_url
+        self._pool: Optional[asyncpg.Pool] = None
+        logger.info("CreditManager initialized (pool not yet connected)")
 
     # ------------------------------------------------------------------
     # Lifecycle
     # ------------------------------------------------------------------
-    async def connect(self) -> None:
-        logger.info("Connecting to PostgreSQL...")
-        self.pool = await asyncpg.create_pool(
-            DATABASE_URL,
-            min_size=2,
-            max_size=10,
-            command_timeout=15,
-        )
-        # Ensure schema exists (idempotent)
-        async with self.pool.acquire() as conn:
-            await conn.execute("""
-                CREATE TABLE IF NOT EXISTS users (
-                    user_id    BIGINT PRIMARY KEY,
-                    username   TEXT DEFAULT '',
-                    role       TEXT NOT NULL DEFAULT 'free'
-                                   CHECK (role IN ('owner','free','premium')),
-                    daily_used INTEGER NOT NULL DEFAULT 0,
-                    last_reset DATE NOT NULL DEFAULT CURRENT_DATE
-                );
-            """)
-            # Guarantee owner row
-            await conn.execute("""
-                INSERT INTO users (user_id, username, role, daily_used, last_reset)
-                VALUES ($1, $2, 'owner', 0, CURRENT_DATE)
-                ON CONFLICT (user_id) DO UPDATE SET role = 'owner';
-            """, OWNER_USER_ID, OWNER_USERNAME)
-        logger.info("PostgreSQL connected and schema verified.")
+    async def initialize(self) -> None:
+        """Create the connection pool and ensure the schema exists."""
+        try:
+            self._pool = await asyncpg.create_pool(
+                dsn=self._database_url,
+                min_size=2,
+                max_size=10,
+                command_timeout=15,
+            )
+            logger.info("asyncpg connection pool created")
+            await self._ensure_schema()
+            await self._ensure_owner()
+            logger.info("Database schema verified and owner ensured")
+        except Exception as e:
+            logger.error(f"Failed to initialize CreditManager: {e}")
+            raise
 
     async def close(self) -> None:
-        if self.pool:
-            await self.pool.close()
-            logger.info("PostgreSQL connection pool closed.")
+        if self._pool:
+            await self._pool.close()
+            logger.info("asyncpg pool closed")
 
     # ------------------------------------------------------------------
-    # User helpers
+    # Schema
     # ------------------------------------------------------------------
-    async def ensure_user(self, user_id: int, username: str = "") -> asyncpg.Record:
-        """Return the user row, creating it as 'free' if it doesn't exist."""
-        async with self.pool.acquire() as conn:
-            row = await conn.fetchrow(
-                "SELECT * FROM users WHERE user_id = $1", user_id
-            )
-            if row is None:
-                # Auto-register
-                await conn.execute("""
-                    INSERT INTO users (user_id, username, role, daily_used, last_reset)
-                    VALUES ($1, $2, 'free', 0, CURRENT_DATE)
-                    ON CONFLICT (user_id) DO NOTHING;
-                """, user_id, username or "")
-                row = await conn.fetchrow(
-                    "SELECT * FROM users WHERE user_id = $1", user_id
-                )
-                logger.info(
-                    f"New user registered: {user_id} ({username}) as free"
-                )
-            return row
-
-    async def _reset_if_new_day(
-        self, conn: asyncpg.Connection, user_id: int
-    ) -> None:
-        """Reset daily_used to 0 if the stored last_reset is before today (UTC)."""
-        today = date.today()
-        await conn.execute("""
-            UPDATE users
-               SET daily_used = 0,
-                   last_reset = $2
-             WHERE user_id = $1
-               AND last_reset < $2;
-        """, user_id, today)
-
-    async def check_and_consume_credit(
-        self, user_id: int, username: str = ""
-    ) -> tuple[bool, str, int, Optional[int]]:
-        """
-        Returns (allowed, role, used_after, limit_or_none).
-        If allowed is True the counter has already been incremented.
-        """
-        async with self.pool.acquire() as conn:
-            # Ensure user exists
-            row = await conn.fetchrow(
-                "SELECT * FROM users WHERE user_id = $1", user_id
-            )
-            if row is None:
-                await conn.execute("""
-                    INSERT INTO users (user_id, username, role, daily_used, last_reset)
-                    VALUES ($1, $2, 'free', 0, CURRENT_DATE)
-                    ON CONFLICT (user_id) DO NOTHING;
-                """, user_id, username or "")
-                row = await conn.fetchrow(
-                    "SELECT * FROM users WHERE user_id = $1", user_id
-                )
-
-            # Reset if new day
-            await self._reset_if_new_day(conn, user_id)
-
-            # Re-fetch after possible reset
-            row = await conn.fetchrow(
-                "SELECT role, daily_used FROM users WHERE user_id = $1",
-                user_id,
-            )
-            role = row["role"]
-            daily_used = row["daily_used"]
-            limit = ROLE_LIMITS.get(role)
-
-            # Owner → unlimited
-            if limit is None:
-                await conn.execute(
-                    "UPDATE users SET daily_used = daily_used + 1 WHERE user_id = $1",
-                    user_id,
-                )
-                return True, role, daily_used + 1, None
-
-            # Check limit
-            if daily_used >= limit:
-                logger.info(
-                    f"User {user_id} ({role}) hit daily limit "
-                    f"({daily_used}/{limit})"
-                )
-                return False, role, daily_used, limit
-
-            # Consume
-            await conn.execute(
-                "UPDATE users SET daily_used = daily_used + 1 WHERE user_id = $1",
-                user_id,
-            )
-            return True, role, daily_used + 1, limit
-
-    async def get_user_info(
-        self, user_id: int, username: str = ""
-    ) -> asyncpg.Record:
-        """Return full user row with day-reset applied."""
-        async with self.pool.acquire() as conn:
-            row = await conn.fetchrow(
-                "SELECT * FROM users WHERE user_id = $1", user_id
-            )
-            if row is None:
-                await conn.execute("""
-                    INSERT INTO users (user_id, username, role, daily_used, last_reset)
-                    VALUES ($1, $2, 'free', 0, CURRENT_DATE)
-                    ON CONFLICT (user_id) DO NOTHING;
-                """, user_id, username or "")
-                row = await conn.fetchrow(
-                    "SELECT * FROM users WHERE user_id = $1", user_id
-                )
-            await self._reset_if_new_day(conn, user_id)
-            return await conn.fetchrow(
-                "SELECT * FROM users WHERE user_id = $1", user_id
-            )
-
-    async def set_role(self, user_id: int, role: str) -> bool:
-        """Set a user's role. Returns True if a row was updated."""
-        async with self.pool.acquire() as conn:
-            # Ensure target exists
+    async def _ensure_schema(self) -> None:
+        async with self._pool.acquire() as conn:
             await conn.execute("""
-                INSERT INTO users (user_id, username, role, daily_used, last_reset)
-                VALUES ($1, '', $2, 0, CURRENT_DATE)
-                ON CONFLICT (user_id) DO UPDATE SET role = $2;
-            """, user_id, role)
-            return True
+                CREATE TABLE IF NOT EXISTS users (
+                    id          SERIAL PRIMARY KEY,
+                    telegram_id BIGINT UNIQUE NOT NULL,
+                    username    TEXT,
+                    role        TEXT NOT NULL DEFAULT 'free',
+                    daily_used  INTEGER NOT NULL DEFAULT 0,
+                    last_reset  DATE NOT NULL DEFAULT CURRENT_DATE,
+                    created_at  TIMESTAMP NOT NULL DEFAULT NOW()
+                );
+            """)
+            await conn.execute("""
+                CREATE INDEX IF NOT EXISTS idx_users_telegram_id
+                ON users (telegram_id);
+            """)
+
+    async def _ensure_owner(self) -> None:
+        async with self._pool.acquire() as conn:
+            row = await conn.fetchrow(
+                "SELECT id FROM users WHERE telegram_id = $1",
+                OWNER_TELEGRAM_ID,
+            )
+            if row is None:
+                await conn.execute(
+                    """INSERT INTO users (telegram_id, username, role)
+                       VALUES ($1, $2, 'owner')""",
+                    OWNER_TELEGRAM_ID,
+                    OWNER_USERNAME,
+                )
+                logger.info(
+                    f"Owner record created: {OWNER_USERNAME} "
+                    f"({OWNER_TELEGRAM_ID})"
+                )
+            else:
+                await conn.execute(
+                    "UPDATE users SET role = 'owner' WHERE telegram_id = $1",
+                    OWNER_TELEGRAM_ID,
+                )
+
+    # ------------------------------------------------------------------
+    # User CRUD
+    # ------------------------------------------------------------------
+    async def get_or_create_user(
+        self, telegram_id: int, username: Optional[str] = None
+    ) -> UserRecord:
+        async with self._pool.acquire() as conn:
+            row = await conn.fetchrow(
+                "SELECT * FROM users WHERE telegram_id = $1",
+                telegram_id,
+            )
+            if row is None:
+                role = "owner" if telegram_id == OWNER_TELEGRAM_ID else "free"
+                row = await conn.fetchrow(
+                    """INSERT INTO users (telegram_id, username, role)
+                       VALUES ($1, $2, $3)
+                       RETURNING *""",
+                    telegram_id,
+                    username,
+                    role,
+                )
+                logger.info(
+                    f"New user created: {username} ({telegram_id}) "
+                    f"role={role}"
+                )
+            else:
+                # Update username if changed
+                if username and row["username"] != username:
+                    await conn.execute(
+                        "UPDATE users SET username = $1 WHERE telegram_id = $2",
+                        username,
+                        telegram_id,
+                    )
+            return self._row_to_record(row)
+
+    # ------------------------------------------------------------------
+    # Credit check + consume (atomic, concurrent-safe)
+    # ------------------------------------------------------------------
+    async def check_and_consume_credit(
+        self, telegram_id: int, username: Optional[str] = None
+    ) -> tuple[bool, str, int, int]:
+        """
+        Returns: (allowed, message, remaining, limit)
+        Uses a single transaction with row-level locking.
+        """
+        async with self._pool.acquire() as conn:
+            async with conn.transaction():
+                # Lock the row for this user
+                row = await conn.fetchrow(
+                    "SELECT * FROM users WHERE telegram_id = $1 FOR UPDATE",
+                    telegram_id,
+                )
+
+                if row is None:
+                    # Auto-create inside the transaction
+                    role = (
+                        "owner"
+                        if telegram_id == OWNER_TELEGRAM_ID
+                        else "free"
+                    )
+                    row = await conn.fetchrow(
+                        """INSERT INTO users (telegram_id, username, role)
+                           VALUES ($1, $2, $3)
+                           RETURNING *""",
+                        telegram_id,
+                        username,
+                        role,
+                    )
+                    logger.info(
+                        f"Auto-created user in credit check: "
+                        f"{username} ({telegram_id})"
+                    )
+
+                user_role = row["role"]
+                daily_used = row["daily_used"]
+                last_reset = row["last_reset"]
+
+                # Owner: unlimited
+                if user_role == "owner":
+                    return True, "", -1, -1
+
+                limit = CREDIT_LIMITS.get(user_role, 5)
+                today = date.today()
+
+                # Reset if new day
+                if last_reset < today:
+                    daily_used = 0
+                    await conn.execute(
+                        """UPDATE users
+                           SET daily_used = 0, last_reset = $1
+                           WHERE telegram_id = $2""",
+                        today,
+                        telegram_id,
+                    )
+                    logger.info(
+                        f"Daily reset for user {telegram_id} "
+                        f"(was {row['daily_used']})"
+                    )
+
+                remaining = limit - daily_used
+
+                if remaining <= 0:
+                    role_label = "Premium" if user_role == "premium" else "Free"
+                    msg = (
+                        f"❌ Daily limit reached ({limit}/{limit}).\n"
+                    )
+                    if user_role == "free":
+                        msg += "Upgrade to Premium for 50 commands/day."
+                    else:
+                        msg += "Your premium limit resets at 00:00 UTC."
+                    return False, msg, 0, limit
+
+                # Consume one credit
+                new_used = daily_used + 1
+                await conn.execute(
+                    """UPDATE users
+                       SET daily_used = $1
+                       WHERE telegram_id = $2""",
+                    new_used,
+                    telegram_id,
+                )
+
+                new_remaining = limit - new_used
+                logger.info(
+                    f"Credit consumed: user={telegram_id} "
+                    f"used={new_used}/{limit} remaining={new_remaining}"
+                )
+                return True, "", new_remaining, limit
+
+    # ------------------------------------------------------------------
+    # Admin: add/remove premium
+    # ------------------------------------------------------------------
+    async def set_premium(self, telegram_id: int) -> tuple[bool, str]:
+        async with self._pool.acquire() as conn:
+            if telegram_id == OWNER_TELEGRAM_ID:
+                return False, "Cannot modify owner role."
+
+            row = await conn.fetchrow(
+                "SELECT * FROM users WHERE telegram_id = $1",
+                telegram_id,
+            )
+            if row is None:
+                # Create the user as premium even if they haven't interacted
+                await conn.execute(
+                    """INSERT INTO users (telegram_id, role)
+                       VALUES ($1, 'premium')""",
+                    telegram_id,
+                )
+                logger.info(
+                    f"ADMIN: Created and set premium for {telegram_id}"
+                )
+                return True, (
+                    f"✅ User `{telegram_id}` created as Premium."
+                )
+
+            if row["role"] == "premium":
+                return False, (
+                    f"ℹ️ User `{telegram_id}` is already Premium."
+                )
+
+            await conn.execute(
+                """UPDATE users SET role = 'premium', daily_used = 0
+                   WHERE telegram_id = $1""",
+                telegram_id,
+            )
+            logger.info(
+                f"ADMIN: Upgraded user {telegram_id} to premium"
+            )
+            uname = row["username"] or str(telegram_id)
+            return True, (
+                f"✅ User `{telegram_id}` ({uname}) upgraded to Premium."
+            )
+
+    async def remove_premium(self, telegram_id: int) -> tuple[bool, str]:
+        async with self._pool.acquire() as conn:
+            if telegram_id == OWNER_TELEGRAM_ID:
+                return False, "Cannot modify owner role."
+
+            row = await conn.fetchrow(
+                "SELECT * FROM users WHERE telegram_id = $1",
+                telegram_id,
+            )
+            if row is None:
+                return False, f"❌ User `{telegram_id}` not found."
+
+            if row["role"] != "premium":
+                return False, (
+                    f"ℹ️ User `{telegram_id}` is not Premium "
+                    f"(current role: {row['role']})."
+                )
+
+            await conn.execute(
+                """UPDATE users SET role = 'free', daily_used = 0
+                   WHERE telegram_id = $1""",
+                telegram_id,
+            )
+            logger.info(
+                f"ADMIN: Downgraded user {telegram_id} to free"
+            )
+            uname = row["username"] or str(telegram_id)
+            return True, (
+                f"✅ User `{telegram_id}` ({uname}) downgraded to Free."
+            )
+
+    # ------------------------------------------------------------------
+    # Info helpers
+    # ------------------------------------------------------------------
+    async def get_user_info(self, telegram_id: int) -> Optional[UserRecord]:
+        async with self._pool.acquire() as conn:
+            row = await conn.fetchrow(
+                "SELECT * FROM users WHERE telegram_id = $1",
+                telegram_id,
+            )
+            if row:
+                return self._row_to_record(row)
+            return None
+
+    async def get_stats(self) -> dict:
+        async with self._pool.acquire() as conn:
+            total = await conn.fetchval("SELECT COUNT(*) FROM users")
+            premium = await conn.fetchval(
+                "SELECT COUNT(*) FROM users WHERE role = 'premium'"
+            )
+            active_today = await conn.fetchval(
+                "SELECT COUNT(*) FROM users "
+                "WHERE last_reset = CURRENT_DATE AND daily_used > 0"
+            )
+            return {
+                "total_users": total,
+                "premium_users": premium,
+                "active_today": active_today,
+            }
+
+    @staticmethod
+    def _row_to_record(row: asyncpg.Record) -> UserRecord:
+        return UserRecord(
+            id=row["id"],
+            telegram_id=row["telegram_id"],
+            username=row["username"],
+            role=row["role"],
+            daily_used=row["daily_used"],
+            last_reset=row["last_reset"],
+            created_at=row["created_at"],
+        )
 
 
-db = DatabaseManager()
+# Global instance (initialized in post_init)
+credit_manager = CreditManager(DATABASE_URL)
 
 
 # =============================================================================
-# MODULE 2: TWELVE DATA CLIENT WITH KEY ROTATION
+# CREDIT CHECK DECORATOR
+# =============================================================================
+def require_credits(func: Callable) -> Callable:
+    """
+    Decorator that checks and consumes a credit before running the handler.
+    Injects `remaining_credits` and `credit_limit` into context.user_data.
+    """
+    @functools.wraps(func)
+    async def wrapper(
+        update: Update, context: ContextTypes.DEFAULT_TYPE
+    ) -> Any:
+        user = update.effective_user
+        if not user:
+            return
+
+        allowed, msg, remaining, limit = (
+            await credit_manager.check_and_consume_credit(
+                telegram_id=user.id,
+                username=user.username,
+            )
+        )
+
+        if not allowed:
+            await update.message.reply_text(msg)
+            logger.info(
+                f"Credit denied for user {user.id} ({user.username})"
+            )
+            return
+
+        # Store for use inside the handler
+        context.user_data["remaining_credits"] = remaining
+        context.user_data["credit_limit"] = limit
+
+        return await func(update, context)
+
+    return wrapper
+
+
+def build_credit_footer(context: ContextTypes.DEFAULT_TYPE) -> str:
+    """Returns the 📊 Remaining today: X/Y line."""
+    remaining = context.user_data.get("remaining_credits", -1)
+    limit = context.user_data.get("credit_limit", -1)
+
+    if remaining == -1 or limit == -1:
+        return "\n📊 Remaining today: ∞ (Owner)"
+    return f"\n📊 Remaining today: {remaining}/{limit}"
+
+
+def build_credit_footer_escaped(context: ContextTypes.DEFAULT_TYPE) -> str:
+    """MarkdownV2 escaped version."""
+    remaining = context.user_data.get("remaining_credits", -1)
+    limit = context.user_data.get("credit_limit", -1)
+
+    if remaining == -1 or limit == -1:
+        return "\n📊 Remaining today: ∞ \\(Owner\\)"
+    return f"\n📊 Remaining today: {remaining}/{limit}"
+
+
+# =============================================================================
+# OWNER-ONLY DECORATOR
+# =============================================================================
+def owner_only(func: Callable) -> Callable:
+    @functools.wraps(func)
+    async def wrapper(
+        update: Update, context: ContextTypes.DEFAULT_TYPE
+    ) -> Any:
+        user = update.effective_user
+        if not user or user.id != OWNER_TELEGRAM_ID:
+            await update.message.reply_text(
+                "🚫 This command is restricted to the bot owner."
+            )
+            logger.warning(
+                f"Unauthorized admin attempt by user {user.id} "
+                f"({user.username})"
+            )
+            return
+        return await func(update, context)
+    return wrapper
+
+
+# =============================================================================
+# MODULE 1: TWELVE DATA CLIENT (WITH KEY ROTATION)
 # =============================================================================
 class TwelveDataClient:
-    """HTTP client for Twelve Data with automatic API key rotation."""
 
-    # HTTP codes / JSON messages that signal quota exhaustion
-    _QUOTA_CODES = {429}
-    _QUOTA_MESSAGES = {
-        "You have run out of API credits",
-        "Too many requests",
-        "api credits",
-    }
-
-    def __init__(self, api_keys: list[str]) -> None:
-        if not api_keys:
-            raise ValueError("At least one TwelveData API key is required")
-        self.api_keys = list(api_keys)
-        self._current_index = 0
+    def __init__(self, api_keys: list[str]):
+        self._api_keys = api_keys
+        self._current_key_index = 0
         self._lock = asyncio.Lock()
         self.session = requests.Session()
-        self.session.headers.update({"User-Agent": "XAUUSD-AI-Bot/3.0"})
+        self.session.headers.update({"User-Agent": "XAUUSD-AI-Bot/2.1"})
         logger.info(
-            f"TwelveData client initialised with {len(self.api_keys)} key(s). "
-            f"Active key index: 0"
+            f"TwelveDataClient initialized with {len(api_keys)} API key(s)"
         )
 
     @property
-    def active_key(self) -> str:
-        return self.api_keys[self._current_index]
+    def current_key(self) -> str:
+        return self._api_keys[self._current_key_index]
 
-    def _rotate_key(self) -> Optional[str]:
-        """Move to the next key. Returns the new key, or None if exhausted."""
-        next_index = self._current_index + 1
-        if next_index >= len(self.api_keys):
-            return None
-        self._current_index = next_index
-        logger.warning(
-            f"Rotated to TwelveData key index {self._current_index} "
-            f"(of {len(self.api_keys)})"
-        )
-        return self.api_keys[self._current_index]
-
-    def _reset_rotation(self) -> None:
-        """Reset back to first key (called at start of a new request cycle)."""
-        self._current_index = 0
-
-    def _is_quota_error(self, response: requests.Response) -> bool:
-        if response.status_code in self._QUOTA_CODES:
+    async def _rotate_key(self, failed_index: int) -> bool:
+        """
+        Rotate to the next API key. Returns True if a new key is available.
+        Thread/async-safe via lock.
+        """
+        async with self._lock:
+            # Only rotate if we're still on the same failed key
+            if self._current_key_index != failed_index:
+                return True  # Already rotated by another call
+            next_index = failed_index + 1
+            if next_index >= len(self._api_keys):
+                logger.error("All TwelveData API keys exhausted!")
+                return False
+            self._current_key_index = next_index
+            logger.warning(
+                f"TwelveData API key rotated to key #{next_index + 1} "
+                f"of {len(self._api_keys)}"
+            )
             return True
-        try:
-            body = response.json()
-            msg = str(body.get("message", "")).lower()
-            code = body.get("code", 0)
-            if code == 429:
-                return True
-            for phrase in self._QUOTA_MESSAGES:
-                if phrase.lower() in msg:
-                    return True
-        except (ValueError, AttributeError):
-            pass
-        return False
 
-    # ------------------------------------------------------------------
-    # Public fetch methods
-    # ------------------------------------------------------------------
+    def _fetch_time_series_with_key(
+        self, api_key: str, interval: str, outputsize: int
+    ) -> Optional[pd.DataFrame]:
+        url = f"{TWELVEDATA_BASE_URL}/time_series"
+        params = {
+            "symbol": SYMBOL,
+            "interval": interval,
+            "outputsize": outputsize,
+            "apikey": api_key,
+            "format": "JSON",
+            "dp": 2,
+        }
+        try:
+            logger.info(
+                f"Fetching {SYMBOL} | interval={interval} | size={outputsize}"
+            )
+            response = self.session.get(url, params=params, timeout=15)
+            response.raise_for_status()
+            data = response.json()
+
+            if "code" in data and data["code"] != 200:
+                error_msg = data.get("message", "Unknown")
+                logger.error(f"TwelveData API error: {error_msg}")
+                # Check if it's a rate/credit limit error
+                code = data.get("code", 0)
+                if code in (429, 401, 403) or "credit" in error_msg.lower():
+                    return "ROTATE"  # Signal to rotate key
+                return None
+            if "values" not in data or not data["values"]:
+                logger.error("TwelveData returned empty values")
+                return None
+
+            df = pd.DataFrame(data["values"])
+            df["datetime"] = pd.to_datetime(df["datetime"])
+            for col in ["open", "high", "low", "close"]:
+                df[col] = pd.to_numeric(df[col], errors="coerce")
+            if "volume" in df.columns:
+                df["volume"] = (
+                    pd.to_numeric(df["volume"], errors="coerce").fillna(0)
+                )
+            else:
+                df["volume"] = 0
+
+            df = df.sort_values("datetime").reset_index(drop=True)
+            df = df.dropna(
+                subset=["open", "high", "low", "close"]
+            ).reset_index(drop=True)
+            logger.info(f"Fetched {len(df)} candles for {SYMBOL}")
+            return df
+
+        except requests.exceptions.Timeout:
+            logger.error("TwelveData request timed out")
+        except requests.exceptions.ConnectionError:
+            logger.error("Failed to connect to TwelveData")
+        except requests.exceptions.HTTPError as e:
+            status_code = getattr(e.response, "status_code", 0)
+            if status_code in (429, 401, 403):
+                return "ROTATE"
+            logger.error(f"HTTP error from TwelveData: {e}")
+        except (ValueError, KeyError) as e:
+            logger.error(f"Error parsing TwelveData response: {e}")
+        return None
+
     def fetch_time_series(
         self,
         interval: str,
         outputsize: int = DEFAULT_OUTPUTSIZE,
     ) -> Optional[pd.DataFrame]:
-        self._reset_rotation()
+        """
+        Fetch with automatic key rotation. Synchronous (called via executor).
+        """
+        tried_keys = set()
+        while self._current_key_index not in tried_keys:
+            key_idx = self._current_key_index
+            tried_keys.add(key_idx)
+            api_key = self._api_keys[key_idx]
 
-        while True:
-            key = self.active_key
-            url = f"{TWELVEDATA_BASE_URL}/time_series"
-            params = {
-                "symbol": SYMBOL,
-                "interval": interval,
-                "outputsize": outputsize,
-                "apikey": key,
-                "format": "JSON",
-                "dp": 2,
-            }
-            try:
-                key_label = f"key[{self._current_index}]"
-                logger.info(
-                    f"Fetching {SYMBOL} | interval={interval} | "
-                    f"size={outputsize} | {key_label}"
+            result = self._fetch_time_series_with_key(
+                api_key, interval, outputsize
+            )
+
+            if result == "ROTATE":
+                logger.warning(
+                    f"Key #{key_idx + 1} exhausted/rejected, rotating..."
                 )
-                response = self.session.get(url, params=params, timeout=15)
-
-                # Check for quota error before anything else
-                if self._is_quota_error(response):
-                    logger.warning(
-                        f"Quota exhausted on {key_label}. Rotating..."
-                    )
-                    next_key = self._rotate_key()
-                    if next_key is None:
-                        logger.error("All TwelveData API keys exhausted.")
-                        return None
-                    continue
-
-                response.raise_for_status()
-                data = response.json()
-
-                if "code" in data and data["code"] != 200:
-                    logger.error(
-                        f"TwelveData API error: {data.get('message', 'Unknown')}"
-                    )
+                # We need to rotate; since this runs in an executor,
+                # do it synchronously by directly manipulating index
+                next_idx = key_idx + 1
+                if next_idx >= len(self._api_keys):
+                    logger.error("All TwelveData API keys exhausted!")
                     return None
-                if "values" not in data or not data["values"]:
-                    logger.error("TwelveData returned empty values")
-                    return None
+                self._current_key_index = next_idx
+                logger.warning(
+                    f"Rotated to key #{next_idx + 1}/{len(self._api_keys)}"
+                )
+                continue
 
-                df = pd.DataFrame(data["values"])
-                df["datetime"] = pd.to_datetime(df["datetime"])
-                for col in ["open", "high", "low", "close"]:
-                    df[col] = pd.to_numeric(df[col], errors="coerce")
-                if "volume" in df.columns:
-                    df["volume"] = (
-                        pd.to_numeric(df["volume"], errors="coerce").fillna(0)
-                    )
-                else:
-                    df["volume"] = 0
+            return result
 
-                df = df.sort_values("datetime").reset_index(drop=True)
-                df = df.dropna(
-                    subset=["open", "high", "low", "close"]
-                ).reset_index(drop=True)
-                logger.info(f"Fetched {len(df)} candles for {SYMBOL}")
-                return df
+        logger.error("All TwelveData API keys tried, none worked")
+        return None
 
-            except requests.exceptions.Timeout:
-                logger.error(f"TwelveData request timed out on key[{self._current_index}]")
-                next_key = self._rotate_key()
-                if next_key is None:
-                    return None
-            except requests.exceptions.ConnectionError:
-                logger.error("Failed to connect to TwelveData")
+    def _fetch_price_with_key(self, api_key: str) -> Optional[dict]:
+        url = f"{TWELVEDATA_BASE_URL}/price"
+        params = {
+            "symbol": SYMBOL,
+            "apikey": api_key,
+            "dp": 2,
+        }
+        try:
+            response = self.session.get(url, params=params, timeout=10)
+            response.raise_for_status()
+            data = response.json()
+
+            if "code" in data and data["code"] != 200:
+                error_msg = data.get("message", "Unknown")
+                code = data.get("code", 0)
+                if code in (429, 401, 403) or "credit" in error_msg.lower():
+                    return "ROTATE"
                 return None
-            except requests.exceptions.HTTPError as e:
-                logger.error(f"HTTP error from TwelveData: {e}")
+
+            if "price" not in data:
+                logger.error(f"No price in response: {data}")
                 return None
-            except (ValueError, KeyError) as e:
-                logger.error(f"Error parsing TwelveData response: {e}")
-                return None
+            return {
+                "price": float(data["price"]),
+                "timestamp": datetime.now(timezone.utc).strftime(
+                    "%Y-%m-%d %H:%M:%S UTC"
+                ),
+            }
+        except requests.exceptions.HTTPError as e:
+            status_code = getattr(e.response, "status_code", 0)
+            if status_code in (429, 401, 403):
+                return "ROTATE"
+            logger.error(f"HTTP error fetching price: {e}")
+        except Exception as e:
+            logger.error(f"Error fetching price: {e}")
+        return None
 
     def fetch_current_price(self) -> Optional[dict]:
-        self._reset_rotation()
+        tried_keys = set()
+        while self._current_key_index not in tried_keys:
+            key_idx = self._current_key_index
+            tried_keys.add(key_idx)
+            api_key = self._api_keys[key_idx]
 
-        while True:
-            key = self.active_key
-            url = f"{TWELVEDATA_BASE_URL}/price"
-            params = {
-                "symbol": SYMBOL,
-                "apikey": key,
-                "dp": 2,
-            }
-            try:
-                response = self.session.get(url, params=params, timeout=10)
+            result = self._fetch_price_with_key(api_key)
 
-                if self._is_quota_error(response):
-                    logger.warning(
-                        f"Quota exhausted on key[{self._current_index}] "
-                        f"(price). Rotating..."
-                    )
-                    next_key = self._rotate_key()
-                    if next_key is None:
-                        logger.error("All TwelveData API keys exhausted.")
-                        return None
-                    continue
-
-                response.raise_for_status()
-                data = response.json()
-                if "price" not in data:
-                    logger.error(f"No price in response: {data}")
-                    return None
-                return {
-                    "price": float(data["price"]),
-                    "timestamp": datetime.now(timezone.utc).strftime(
-                        "%Y-%m-%d %H:%M:%S UTC"
-                    ),
-                }
-            except requests.exceptions.Timeout:
-                logger.error(
-                    f"Price request timed out on key[{self._current_index}]"
+            if result == "ROTATE":
+                logger.warning(
+                    f"Price: Key #{key_idx + 1} exhausted, rotating..."
                 )
-                next_key = self._rotate_key()
-                if next_key is None:
+                next_idx = key_idx + 1
+                if next_idx >= len(self._api_keys):
+                    logger.error("All TwelveData API keys exhausted!")
                     return None
-            except Exception as e:
-                logger.error(f"Error fetching price: {e}")
-                return None
+                self._current_key_index = next_idx
+                continue
+
+            return result
+
+        logger.error("All TwelveData API keys tried for price, none worked")
+        return None
 
 
 td_client = TwelveDataClient(TWELVEDATA_API_KEYS)
 
 
 # =============================================================================
-# MODULE 3: RATE LIMITER (per-client throttle for Twelve Data)
+# RATE LIMITER
 # =============================================================================
 class RateLimiter:
     def __init__(self, max_calls: int = 7, period_seconds: float = 60.0):
@@ -601,7 +855,9 @@ class RateLimiter:
                 )
                 await asyncio.sleep(wait_time)
                 now = time.monotonic()
-                self.calls = [t for t in self.calls if now - t < self.period]
+                self.calls = [
+                    t for t in self.calls if now - t < self.period
+                ]
             self.calls.append(time.monotonic())
             return True
 
@@ -611,7 +867,7 @@ user_sessions: dict[int, UserSession] = {}
 
 
 # =============================================================================
-# MODULE 4: TECHNICAL ANALYSIS ENGINE
+# MODULE 2: TECHNICAL ANALYSIS ENGINE
 # =============================================================================
 class TechnicalAnalysisEngine:
 
@@ -627,12 +883,10 @@ class TechnicalAnalysisEngine:
             )
             return df, indicators
 
-        # RSI (14)
         df["rsi"] = ta.momentum.RSIIndicator(
             close=df["close"], window=14
         ).rsi()
 
-        # EMA 20 & 50
         df["ema_20"] = ta.trend.EMAIndicator(
             close=df["close"], window=20
         ).ema_indicator()
@@ -640,7 +894,6 @@ class TechnicalAnalysisEngine:
             close=df["close"], window=50
         ).ema_indicator()
 
-        # MACD (12, 26, 9)
         macd_calc = ta.trend.MACD(
             close=df["close"],
             window_slow=26,
@@ -651,7 +904,6 @@ class TechnicalAnalysisEngine:
         df["macd_signal"] = macd_calc.macd_signal()
         df["macd_histogram"] = macd_calc.macd_diff()
 
-        # ATR (14)
         df["atr"] = ta.volatility.AverageTrueRange(
             high=df["high"],
             low=df["low"],
@@ -659,7 +911,6 @@ class TechnicalAnalysisEngine:
             window=14,
         ).average_true_range()
 
-        # Support & Resistance
         support, resistance = (
             TechnicalAnalysisEngine._detect_support_resistance(df)
         )
@@ -667,31 +918,43 @@ class TechnicalAnalysisEngine:
         latest = df.iloc[-1]
 
         indicators.rsi = (
-            round(latest["rsi"], 2) if pd.notna(latest["rsi"]) else 0.0
+            round(latest["rsi"], 2)
+            if pd.notna(latest["rsi"])
+            else 0.0
         )
         indicators.ema_20 = (
-            round(latest["ema_20"], 2) if pd.notna(latest["ema_20"]) else 0.0
+            round(latest["ema_20"], 2)
+            if pd.notna(latest["ema_20"])
+            else 0.0
         )
         indicators.ema_50 = (
-            round(latest["ema_50"], 2) if pd.notna(latest["ema_50"]) else 0.0
+            round(latest["ema_50"], 2)
+            if pd.notna(latest["ema_50"])
+            else 0.0
         )
         indicators.macd_line = (
-            round(latest["macd_line"], 4) if pd.notna(latest["macd_line"]) else 0.0
+            round(latest["macd_line"], 4)
+            if pd.notna(latest["macd_line"])
+            else 0.0
         )
         indicators.macd_signal = (
-            round(latest["macd_signal"], 4) if pd.notna(latest["macd_signal"]) else 0.0
+            round(latest["macd_signal"], 4)
+            if pd.notna(latest["macd_signal"])
+            else 0.0
         )
         indicators.macd_histogram = (
             round(latest["macd_histogram"], 4)
-            if pd.notna(latest["macd_histogram"]) else 0.0
+            if pd.notna(latest["macd_histogram"])
+            else 0.0
         )
         indicators.atr = (
-            round(latest["atr"], 2) if pd.notna(latest["atr"]) else 0.0
+            round(latest["atr"], 2)
+            if pd.notna(latest["atr"])
+            else 0.0
         )
         indicators.support = round(support, 2)
         indicators.resistance = round(resistance, 2)
 
-        # RSI Interpretation
         if indicators.rsi >= 70:
             indicators.rsi_interpretation = "Overbought"
         elif indicators.rsi >= 60:
@@ -703,7 +966,6 @@ class TechnicalAnalysisEngine:
         else:
             indicators.rsi_interpretation = "Oversold"
 
-        # EMA Trend
         if indicators.ema_20 > indicators.ema_50:
             if latest["close"] > indicators.ema_20:
                 indicators.ema_trend = "Strong Bullish"
@@ -717,7 +979,6 @@ class TechnicalAnalysisEngine:
         else:
             indicators.ema_trend = "Neutral"
 
-        # MACD
         if indicators.macd_histogram > 0:
             indicators.macd_interpretation = "Positive"
         elif indicators.macd_histogram < 0:
@@ -725,10 +986,10 @@ class TechnicalAnalysisEngine:
         else:
             indicators.macd_interpretation = "Neutral"
 
-        # Volatility
         atr_pct = (
             (indicators.atr / latest["close"]) * 100
-            if latest["close"] > 0 else 0
+            if latest["close"] > 0
+            else 0
         )
         if atr_pct > 1.0:
             indicators.volatility_condition = "High Volatility"
@@ -737,7 +998,6 @@ class TechnicalAnalysisEngine:
         else:
             indicators.volatility_condition = "Low Volatility"
 
-        # Overall Trend
         bullish = sum([
             indicators.rsi > 50,
             indicators.ema_20 > indicators.ema_50,
@@ -760,17 +1020,19 @@ class TechnicalAnalysisEngine:
             return df["low"].min(), df["high"].max()
 
         recent = df.tail(60).copy()
-        swing_lows: list[float] = []
-        swing_highs: list[float] = []
+        swing_lows = []
+        swing_highs = []
 
         for i in range(window, len(recent) - window):
-            segment = recent.iloc[i - window: i + window + 1]
+            segment = recent.iloc[i - window : i + window + 1]
             if recent.iloc[i]["low"] == segment["low"].min():
                 swing_lows.append(recent.iloc[i]["low"])
             if recent.iloc[i]["high"] == segment["high"].max():
                 swing_highs.append(recent.iloc[i]["high"])
 
-        support = max(swing_lows[-3:]) if swing_lows else recent["low"].min()
+        support = (
+            max(swing_lows[-3:]) if swing_lows else recent["low"].min()
+        )
         resistance = (
             min(swing_highs[-3:]) if swing_highs else recent["high"].max()
         )
@@ -786,17 +1048,17 @@ ta_engine = TechnicalAnalysisEngine()
 
 
 # =============================================================================
-# MODULE 5: GEMINI AI ANALYSIS
+# MODULE 3: GEMINI AI ANALYSIS
 # =============================================================================
 class GeminiAnalyzer:
 
-    def __init__(self, api_key: str) -> None:
+    def __init__(self, api_key: str):
         self.client = genai.Client(api_key=api_key)
         self.model_name = GEMINI_MODEL
         self._max_retries = 3
         self._retry_delay = 2.0
         logger.info(
-            f"Gemini AI initialised | model: {self.model_name}"
+            f"Gemini AI initialized | model: {self.model_name}"
         )
 
     def generate_analysis(
@@ -834,19 +1096,25 @@ class GeminiAnalyzer:
                 raw_text = response.text
 
                 if not raw_text or len(raw_text.strip()) < 20:
-                    logger.warning(f"Attempt {attempt}: Empty/short response")
+                    logger.warning(
+                        f"Attempt {attempt}: Empty/short response"
+                    )
                     last_error = "Empty response from AI"
                     if attempt < self._max_retries:
                         time.sleep(self._retry_delay * attempt)
                     continue
 
                 analysis.raw_response = raw_text
-                logger.info(f"Gemini response received ({len(raw_text)} chars)")
+                logger.info(
+                    f"Gemini response received ({len(raw_text)} chars)"
+                )
 
                 analysis = self._parse_response(raw_text, analysis)
 
                 if analysis.bias not in ("N/A", "Error", ""):
-                    logger.info(f"AI analysis parsed: bias={analysis.bias}")
+                    logger.info(
+                        f"AI analysis parsed: bias={analysis.bias}"
+                    )
                     return analysis
 
                 logger.warning(
@@ -873,12 +1141,12 @@ class GeminiAnalyzer:
                     time.sleep(sleep_time)
 
         logger.error(
-            f"All {self._max_retries} attempts failed. Last error: {last_error}"
+            f"All {self._max_retries} attempts failed. "
+            f"Last error: {last_error}"
         )
         analysis = self._generate_fallback_analysis(indicators, df)
         return analysis
 
-    # -- prompt builder (unchanged logic) ----------------------------------
     def _build_prompt(
         self,
         latest: pd.Series,
@@ -890,7 +1158,8 @@ class GeminiAnalyzer:
         price_change = latest["close"] - prev["close"]
         price_change_pct = (
             (price_change / prev["close"]) * 100
-            if prev["close"] > 0 else 0
+            if prev["close"] > 0
+            else 0
         )
         last_5_closes = df["close"].tail(5).tolist()
         last_5_str = ", ".join([f"{c:.2f}" for c in last_5_closes])
@@ -956,7 +1225,9 @@ class GeminiAnalyzer:
         )
         return prompt
 
-    def _parse_response(self, text: str, analysis: AIAnalysis) -> AIAnalysis:
+    def _parse_response(
+        self, text: str, analysis: AIAnalysis
+    ) -> AIAnalysis:
         if not text:
             return analysis
 
@@ -992,19 +1263,29 @@ class GeminiAnalyzer:
                 analysis.take_profit_2 = value
             elif key in ("RISK", "RISK NOTE", "RISK ASSESSMENT"):
                 analysis.risk_note = value
-            elif key in ("OUTLOOK", "SHORT TERM OUTLOOK", "SHORT-TERM OUTLOOK"):
+            elif key in (
+                "OUTLOOK",
+                "SHORT TERM OUTLOOK",
+                "SHORT-TERM OUTLOOK",
+            ):
                 analysis.short_term_outlook = value
 
         return analysis
 
-    def _fallback_parse(self, text: str, analysis: AIAnalysis) -> AIAnalysis:
+    def _fallback_parse(
+        self, text: str, analysis: AIAnalysis
+    ) -> AIAnalysis:
         if not text:
             return analysis
 
-        text_clean = text.replace("**", "").replace("*", "").replace("`", "")
+        text_clean = (
+            text.replace("**", "").replace("*", "").replace("`", "")
+        )
 
         patterns = {
-            "bias": r"(?:BIAS|MARKET\s*BIAS)\s*[:=]\s*(.+?)(?:\n|$)",
+            "bias": (
+                r"(?:BIAS|MARKET\s*BIAS)\s*[:=]\s*(.+?)(?:\n|$)"
+            ),
             "trade_idea": (
                 r"(?:TRADE|TRADE\s*IDEA|ACTION|SIGNAL)"
                 r"\s*[:=]\s*(.+?)(?:\n|$)"
@@ -1013,7 +1294,9 @@ class GeminiAnalyzer:
                 r"(?:ENTRY|ENTRY\s*(?:ZONE|PRICE)?)"
                 r"\s*[:=]\s*(.+?)(?:\n|$)"
             ),
-            "stop_loss": r"(?:STOP[\s_]*LOSS|SL)\s*[:=]\s*(.+?)(?:\n|$)",
+            "stop_loss": (
+                r"(?:STOP[\s_]*LOSS|SL)\s*[:=]\s*(.+?)(?:\n|$)"
+            ),
             "take_profit_1": (
                 r"(?:TP1|TAKE[\s_]*PROFIT[\s_]*1|TARGET[\s_]*1)"
                 r"\s*[:=]\s*(.+?)(?:\n|$)"
@@ -1040,7 +1323,8 @@ class GeminiAnalyzer:
                     setattr(analysis, field_name, value)
 
         logger.info(
-            f"Fallback parse: bias={analysis.bias}, trade={analysis.trade_idea}"
+            f"Fallback parse: bias={analysis.bias}, "
+            f"trade={analysis.trade_idea}"
         )
         return analysis
 
@@ -1049,7 +1333,9 @@ class GeminiAnalyzer:
         indicators: TechnicalIndicators,
         df: pd.DataFrame,
     ) -> AIAnalysis:
-        logger.warning("Using indicator-based fallback (Gemini unavailable)")
+        logger.warning(
+            "Using indicator-based fallback (Gemini unavailable)"
+        )
         analysis = AIAnalysis()
         latest_close = df.iloc[-1]["close"]
         atr = indicators.atr
@@ -1066,35 +1352,50 @@ class GeminiAnalyzer:
             entry_low = latest_close - atr * 0.3
             analysis.entry = f"{entry_low:.2f}-{latest_close:.2f}"
             analysis.stop_loss = f"{indicators.support - atr * 0.5:.2f}"
-            analysis.take_profit_1 = f"{latest_close + atr * 1.5:.2f}"
-            analysis.take_profit_2 = f"{latest_close + atr * 2.5:.2f}"
+            analysis.take_profit_1 = (
+                f"{latest_close + atr * 1.5:.2f}"
+            )
+            analysis.take_profit_2 = (
+                f"{latest_close + atr * 2.5:.2f}"
+            )
         elif bullish_count == 0:
             analysis.bias = "Bearish (Indicator-Based)"
             analysis.trade_idea = "Sell"
             entry_high = latest_close + atr * 0.3
             analysis.entry = f"{latest_close:.2f}-{entry_high:.2f}"
-            analysis.stop_loss = f"{indicators.resistance + atr * 0.5:.2f}"
-            analysis.take_profit_1 = f"{latest_close - atr * 1.5:.2f}"
-            analysis.take_profit_2 = f"{latest_close - atr * 2.5:.2f}"
+            analysis.stop_loss = (
+                f"{indicators.resistance + atr * 0.5:.2f}"
+            )
+            analysis.take_profit_1 = (
+                f"{latest_close - atr * 1.5:.2f}"
+            )
+            analysis.take_profit_2 = (
+                f"{latest_close - atr * 2.5:.2f}"
+            )
         else:
             analysis.bias = "Neutral (Indicator-Based)"
             analysis.trade_idea = "Wait"
             analysis.entry = "Wait for clearer signal"
             analysis.stop_loss = f"{indicators.support:.2f}"
             analysis.take_profit_1 = f"{indicators.resistance:.2f}"
-            analysis.take_profit_2 = f"{indicators.resistance + atr:.2f}"
+            analysis.take_profit_2 = (
+                f"{indicators.resistance + atr:.2f}"
+            )
 
         analysis.risk_note = (
             f"ATR-based volatility: {indicators.volatility_condition}. "
             f"AI service unavailable - using indicator fallback."
         )
         analysis.short_term_outlook = (
-            f"RSI at {indicators.rsi:.1f} ({indicators.rsi_interpretation}). "
+            f"RSI at {indicators.rsi:.1f} "
+            f"({indicators.rsi_interpretation}). "
             f"EMA trend: {indicators.ema_trend}. "
             f"Support at {indicators.support:.2f}, "
             f"resistance at {indicators.resistance:.2f}."
         )
-        analysis.raw_response = "[Fallback: Generated from technical indicators]"
+        analysis.raw_response = (
+            "[Fallback: Generated from technical indicators]"
+        )
         return analysis
 
 
@@ -1102,7 +1403,7 @@ gemini_analyzer = GeminiAnalyzer(GEMINI_API_KEY)
 
 
 # =============================================================================
-# MODULE 6: CHART GENERATOR
+# MODULE 4: CHART GENERATOR
 # =============================================================================
 class ChartGenerator:
 
@@ -1120,138 +1421,238 @@ class ChartGenerator:
             plot_df = df.tail(60).copy()
 
             fig, axes = plt.subplots(
-                3, 1,
+                3,
+                1,
                 figsize=CHART_FIGSIZE,
                 gridspec_kw={"height_ratios": [3, 1, 1]},
                 sharex=True,
             )
             fig.suptitle(
                 f"XAU/USD - {timeframe} Analysis",
-                fontsize=16, fontweight="bold",
-                color=COLOR_GOLD, y=0.98,
+                fontsize=16,
+                fontweight="bold",
+                color=COLOR_GOLD,
+                y=0.98,
             )
 
-            # --- Panel 1: Price + EMAs + S/R ---
             ax1 = axes[0]
+
             ax1.plot(
-                plot_df["datetime"], plot_df["close"],
-                color=COLOR_WHITE, linewidth=1.5, label="Close", zorder=5,
+                plot_df["datetime"],
+                plot_df["close"],
+                color=COLOR_WHITE,
+                linewidth=1.5,
+                label="Close",
+                zorder=5,
             )
             ax1.fill_between(
-                plot_df["datetime"], plot_df["low"], plot_df["high"],
-                alpha=0.1, color=COLOR_GOLD,
+                plot_df["datetime"],
+                plot_df["low"],
+                plot_df["high"],
+                alpha=0.1,
+                color=COLOR_GOLD,
             )
 
-            for _, row in plot_df.iterrows():
-                bar_color = COLOR_GREEN if row["close"] >= row["open"] else COLOR_RED
+            for idx_val, row in plot_df.iterrows():
+                if row["close"] >= row["open"]:
+                    bar_color = COLOR_GREEN
+                else:
+                    bar_color = COLOR_RED
+
                 ax1.plot(
                     [row["datetime"], row["datetime"]],
                     [row["low"], row["high"]],
-                    color=bar_color, linewidth=0.8, alpha=0.6,
+                    color=bar_color,
+                    linewidth=0.8,
+                    alpha=0.6,
                 )
                 body_low = min(row["open"], row["close"])
                 body_high = max(row["open"], row["close"])
                 ax1.plot(
                     [row["datetime"], row["datetime"]],
                     [body_low, body_high],
-                    color=bar_color, linewidth=2.5,
+                    color=bar_color,
+                    linewidth=2.5,
                 )
 
             if "ema_20" in plot_df.columns:
+                ema20_label = f"EMA 20 ({indicators.ema_20:.2f})"
                 ax1.plot(
-                    plot_df["datetime"], plot_df["ema_20"],
-                    color=COLOR_BLUE, linewidth=1.2, linestyle="--",
-                    label=f"EMA 20 ({indicators.ema_20:.2f})", alpha=0.9,
+                    plot_df["datetime"],
+                    plot_df["ema_20"],
+                    color=COLOR_BLUE,
+                    linewidth=1.2,
+                    linestyle="--",
+                    label=ema20_label,
+                    alpha=0.9,
                 )
             if "ema_50" in plot_df.columns:
+                ema50_label = f"EMA 50 ({indicators.ema_50:.2f})"
                 ax1.plot(
-                    plot_df["datetime"], plot_df["ema_50"],
-                    color=COLOR_ORANGE, linewidth=1.2, linestyle="--",
-                    label=f"EMA 50 ({indicators.ema_50:.2f})", alpha=0.9,
+                    plot_df["datetime"],
+                    plot_df["ema_50"],
+                    color=COLOR_ORANGE,
+                    linewidth=1.2,
+                    linestyle="--",
+                    label=ema50_label,
+                    alpha=0.9,
                 )
 
+            support_label = f"Support ({indicators.support:.2f})"
             ax1.axhline(
-                y=indicators.support, color=COLOR_GREEN_BRIGHT,
-                linestyle=":", linewidth=1.0, alpha=0.8,
-                label=f"Support ({indicators.support:.2f})",
+                y=indicators.support,
+                color=COLOR_GREEN_BRIGHT,
+                linestyle=":",
+                linewidth=1.0,
+                alpha=0.8,
+                label=support_label,
             )
+
+            resistance_label = f"Resistance ({indicators.resistance:.2f})"
             ax1.axhline(
-                y=indicators.resistance, color=COLOR_RED_BRIGHT,
-                linestyle=":", linewidth=1.0, alpha=0.8,
-                label=f"Resistance ({indicators.resistance:.2f})",
+                y=indicators.resistance,
+                color=COLOR_RED_BRIGHT,
+                linestyle=":",
+                linewidth=1.0,
+                alpha=0.8,
+                label=resistance_label,
             )
+
             ax1.set_ylabel("Price (USD)", fontsize=10, color=COLOR_WHITE)
             ax1.legend(loc="upper left", fontsize=8, framealpha=0.3)
             ax1.grid(True, alpha=0.15)
 
-            # --- Panel 2: RSI ---
             ax2 = axes[1]
+
             if "rsi" in plot_df.columns:
+                rsi_label = f"RSI ({indicators.rsi:.1f})"
                 ax2.plot(
-                    plot_df["datetime"], plot_df["rsi"],
-                    color=COLOR_PURPLE, linewidth=1.5,
-                    label=f"RSI ({indicators.rsi:.1f})",
+                    plot_df["datetime"],
+                    plot_df["rsi"],
+                    color=COLOR_PURPLE,
+                    linewidth=1.5,
+                    label=rsi_label,
                 )
                 ax2.fill_between(
-                    plot_df["datetime"], plot_df["rsi"], 50,
-                    where=(plot_df["rsi"] >= 50), alpha=0.2, color=COLOR_GREEN,
+                    plot_df["datetime"],
+                    plot_df["rsi"],
+                    50,
+                    where=(plot_df["rsi"] >= 50),
+                    alpha=0.2,
+                    color=COLOR_GREEN,
                 )
                 ax2.fill_between(
-                    plot_df["datetime"], plot_df["rsi"], 50,
-                    where=(plot_df["rsi"] < 50), alpha=0.2, color=COLOR_RED,
+                    plot_df["datetime"],
+                    plot_df["rsi"],
+                    50,
+                    where=(plot_df["rsi"] < 50),
+                    alpha=0.2,
+                    color=COLOR_RED,
                 )
-                ax2.axhline(y=70, color=COLOR_RED_BRIGHT, linestyle="--", linewidth=0.8, alpha=0.6)
-                ax2.axhline(y=30, color=COLOR_GREEN_BRIGHT, linestyle="--", linewidth=0.8, alpha=0.6)
-                ax2.axhline(y=50, color=COLOR_GRAY, linestyle="-", linewidth=0.5, alpha=0.4)
+                ax2.axhline(
+                    y=70,
+                    color=COLOR_RED_BRIGHT,
+                    linestyle="--",
+                    linewidth=0.8,
+                    alpha=0.6,
+                )
+                ax2.axhline(
+                    y=30,
+                    color=COLOR_GREEN_BRIGHT,
+                    linestyle="--",
+                    linewidth=0.8,
+                    alpha=0.6,
+                )
+                ax2.axhline(
+                    y=50,
+                    color=COLOR_GRAY,
+                    linestyle="-",
+                    linewidth=0.5,
+                    alpha=0.4,
+                )
+
             ax2.set_ylabel("RSI", fontsize=10, color=COLOR_WHITE)
             ax2.set_ylim(10, 90)
             ax2.legend(loc="upper left", fontsize=8, framealpha=0.3)
             ax2.grid(True, alpha=0.15)
 
-            # --- Panel 3: MACD ---
             ax3 = axes[2]
+
             if "macd_line" in plot_df.columns:
                 ax3.plot(
-                    plot_df["datetime"], plot_df["macd_line"],
-                    color=COLOR_BLUE, linewidth=1.2, label="MACD",
+                    plot_df["datetime"],
+                    plot_df["macd_line"],
+                    color=COLOR_BLUE,
+                    linewidth=1.2,
+                    label="MACD",
                 )
                 ax3.plot(
-                    plot_df["datetime"], plot_df["macd_signal"],
-                    color=COLOR_ORANGE, linewidth=1.2, label="Signal",
+                    plot_df["datetime"],
+                    plot_df["macd_signal"],
+                    color=COLOR_ORANGE,
+                    linewidth=1.2,
+                    label="Signal",
                 )
-                hist_colors = [
-                    COLOR_GREEN if v >= 0 else COLOR_RED
-                    for v in plot_df["macd_histogram"]
-                ]
+
+                hist_colors = []
+                for v in plot_df["macd_histogram"]:
+                    if v >= 0:
+                        hist_colors.append(COLOR_GREEN)
+                    else:
+                        hist_colors.append(COLOR_RED)
+
                 ax3.bar(
-                    plot_df["datetime"], plot_df["macd_histogram"],
-                    color=hist_colors, alpha=0.5, width=0.6,
+                    plot_df["datetime"],
+                    plot_df["macd_histogram"],
+                    color=hist_colors,
+                    alpha=0.5,
+                    width=0.6,
                 )
-                ax3.axhline(y=0, color=COLOR_GRAY, linestyle="-", linewidth=0.5, alpha=0.4)
+                ax3.axhline(
+                    y=0,
+                    color=COLOR_GRAY,
+                    linestyle="-",
+                    linewidth=0.5,
+                    alpha=0.4,
+                )
+
             ax3.set_ylabel("MACD", fontsize=10, color=COLOR_WHITE)
             ax3.legend(loc="upper left", fontsize=8, framealpha=0.3)
             ax3.grid(True, alpha=0.15)
 
-            ax3.xaxis.set_major_formatter(mdates.DateFormatter("%m/%d %H:%M"))
+            ax3.xaxis.set_major_formatter(
+                mdates.DateFormatter("%m/%d %H:%M")
+            )
             plt.xticks(rotation=45, fontsize=8)
 
-            now_str = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+            now_str = datetime.now(timezone.utc).strftime(
+                "%Y-%m-%d %H:%M UTC"
+            )
             fig.text(
-                0.99, 0.01, f"Generated: {now_str}",
-                ha="right", va="bottom", fontsize=7,
-                color=COLOR_GRAY, alpha=0.6,
+                0.99,
+                0.01,
+                f"Generated: {now_str}",
+                ha="right",
+                va="bottom",
+                fontsize=7,
+                color=COLOR_GRAY,
+                alpha=0.6,
             )
 
             plt.tight_layout()
+
             buf = io.BytesIO()
             fig.savefig(
-                buf, format="png", dpi=CHART_DPI,
+                buf,
+                format="png",
+                dpi=CHART_DPI,
                 bbox_inches="tight",
                 facecolor=fig.get_facecolor(),
                 edgecolor="none",
             )
             buf.seek(0)
             plt.close(fig)
+
             logger.info("Chart generated successfully")
             return buf
 
@@ -1265,82 +1666,7 @@ chart_gen = ChartGenerator()
 
 
 # =============================================================================
-# MODULE 7: CREDIT-CHECK MIDDLEWARE (decorator)
-# =============================================================================
-def check_credit(func: Callable) -> Callable:
-    """
-    Decorator that wraps any command handler.
-    Before the handler runs it:
-      1. Ensures the user exists in the DB (auto-registers as 'free').
-      2. Resets daily_used if a new UTC day has started.
-      3. Validates remaining credits for the user's role.
-      4. Increments the counter if allowed.
-      5. Blocks with a friendly message if the limit is reached.
-    """
-
-    @functools.wraps(func)
-    async def wrapper(
-        update: Update,
-        context: ContextTypes.DEFAULT_TYPE,
-        *args: Any,
-        **kwargs: Any,
-    ) -> Any:
-        user = update.effective_user
-        if user is None:
-            return
-
-        user_id = user.id
-        username = user.username or user.first_name or ""
-
-        allowed, role, used, limit = await db.check_and_consume_credit(
-            user_id, username
-        )
-
-        if not allowed:
-            # Build a nice "limit reached" message
-            remaining = 0
-            limit_str = str(limit) if limit is not None else "∞"
-            if role == "free":
-                upgrade_hint = (
-                    "\n\n💎 *Upgrade to Premium* for 50 signals per day\\!\n"
-                    "Contact the bot owner to upgrade\\."
-                )
-            else:
-                upgrade_hint = ""
-
-            msg = (
-                "⛔ *Daily Limit Reached*\n"
-                "━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
-                "\n"
-                f"Role: `{_escape_md(role)}`\n"
-                f"Used today: `{used}/{limit_str}`\n"
-                f"Remaining: `0`\n"
-                "\n"
-                "Your daily credits reset at *00:00 UTC*\\.\n"
-                f"{upgrade_hint}"
-            )
-            await update.message.reply_text(
-                msg, parse_mode=ParseMode.MARKDOWN_V2
-            )
-            logger.info(
-                f"Blocked user {user_id} ({role}): "
-                f"{used}/{limit_str} credits used"
-            )
-            return  # Do NOT run the handler
-
-        # Allowed — log and proceed
-        limit_str = str(limit) if limit is not None else "∞"
-        logger.info(
-            f"Credit consumed: user={user_id} role={role} "
-            f"used={used}/{limit_str}"
-        )
-        return await func(update, context, *args, **kwargs)
-
-    return wrapper
-
-
-# =============================================================================
-# MODULE 8: TELEGRAM BOT HANDLERS
+# MODULE 5: TELEGRAM BOT HANDLERS
 # =============================================================================
 
 def get_session(user_id: int) -> UserSession:
@@ -1362,50 +1688,26 @@ def _escape_md(text: str) -> str:
     return text
 
 
-def _owner_only(func: Callable) -> Callable:
-    """Decorator restricting a command to the owner only."""
-
-    @functools.wraps(func)
-    async def wrapper(
-        update: Update,
-        context: ContextTypes.DEFAULT_TYPE,
-        *args: Any,
-        **kwargs: Any,
-    ) -> Any:
-        if update.effective_user.id != OWNER_USER_ID:
-            await update.message.reply_text(
-                "⛔ This command is restricted to the bot owner."
-            )
-            logger.warning(
-                f"Unauthorised admin attempt by user "
-                f"{update.effective_user.id}"
-            )
-            return
-        return await func(update, context, *args, **kwargs)
-
-    return wrapper
-
-
-# --------------- /start ---------------
 async def cmd_start(
     update: Update, context: ContextTypes.DEFAULT_TYPE
 ) -> None:
     user = update.effective_user
-    # Ensure user in DB
-    await db.ensure_user(user.id, user.username or user.first_name or "")
+    # Ensure user exists in database
+    await credit_manager.get_or_create_user(user.id, user.username)
 
     welcome = (
-        "🥇 *XAUUSD AI Analysis Bot*\n"
-        "━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+        "\U0001f947 *XAUUSD AI Analysis Bot*\n"
+        "\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501"
+        "\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501"
+        "\u2501\u2501\u2501\u2501\u2501\u2501\u2501\n"
         "\n"
         "Welcome\\! I provide real\\-time AI\\-powered "
         "technical analysis for *Gold \\(XAU/USD\\)*\\.\n"
         "\n"
-        "🔹 Real\\-time price data from Twelve Data\n"
-        "🔹 Technical indicators \\(RSI, EMA, MACD, ATR\\)\n"
-        "🔹 AI analysis powered by Google Gemini\n"
-        "🔹 Professional chart generation\n"
-        "🔹 Daily credit system with role\\-based access\n"
+        "\U0001f539 Real\\-time price data from Twelve Data\n"
+        "\U0001f539 Technical indicators \\(RSI, EMA, MACD, ATR\\)\n"
+        "\U0001f539 AI analysis powered by Google Gemini\n"
+        "\U0001f539 Professional chart generation\n"
         "\n"
         "*Available Commands:*\n"
         "/price \\- Latest XAU/USD price\n"
@@ -1413,33 +1715,34 @@ async def cmd_start(
         "/chart \\- Technical analysis chart\n"
         "/timeframe \\- Change timeframe "
         "\\(e\\.g\\. `/timeframe 1h`\\)\n"
-        "/credits \\- Check remaining daily credits\n"
-        "/role \\- Show your current role\n"
+        "/mystatus \\- Your credit status\n"
         "/help \\- Show all commands\n"
         "\n"
         "Default timeframe: *15 Min*\n"
-        "━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+        "\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501"
+        "\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501"
+        "\u2501\u2501\u2501\u2501\u2501\u2501\u2501\n"
         "_Disclaimer: Not financial advice\\. Trade responsibly\\._"
     )
     await update.message.reply_text(welcome, parse_mode=ParseMode.MARKDOWN_V2)
-    logger.info(f"User {user.id} started the bot")
+    logger.info(f"User {user.id} ({user.username}) started the bot")
 
 
-# --------------- /help ---------------
 async def cmd_help(
     update: Update, context: ContextTypes.DEFAULT_TYPE
 ) -> None:
     help_text = (
-        "🔹 *Bot Commands*\n"
-        "━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+        "\U0001f539 *Bot Commands*\n"
+        "\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501"
+        "\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501"
+        "\u2501\u2501\u2501\u2501\u2501\u2501\u2501\n"
         "\n"
         "/start \\- Welcome message\n"
         "/price \\- Latest XAU/USD price\n"
         "/analysis \\- Full AI technical analysis\n"
         "/chart \\- Send technical chart\n"
         "/timeframe <tf> \\- Change timeframe\n"
-        "/credits \\- Remaining daily credits\n"
-        "/role \\- Your current role\n"
+        "/mystatus \\- Your account \\& credit info\n"
         "\n"
         "*Timeframe Options:*\n"
         "  `5m`  \\- 5 Minutes\n"
@@ -1450,80 +1753,23 @@ async def cmd_help(
         "\n"
         "*Example:* `/timeframe 4h`\n"
         "\n"
-        "*Admin Commands \\(Owner only\\):*\n"
-        "/addprem <user\\_id> \\- Promote to Premium\n"
-        "/addpremium <user\\_id> \\- Promote to Premium\n"
-        "/delprem <user\\_id> \\- Demote to Free\n"
-        "/removepremium <user\\_id> \\- Demote to Free\n"
-        "\n"
         "/help \\- This message\n"
-        "━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+        "\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501"
+        "\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501"
+        "\u2501\u2501\u2501\u2501\u2501\u2501\u2501"
     )
     await update.message.reply_text(
         help_text, parse_mode=ParseMode.MARKDOWN_V2
     )
 
 
-# --------------- /credits ---------------
-async def cmd_credits(
-    update: Update, context: ContextTypes.DEFAULT_TYPE
-) -> None:
-    user = update.effective_user
-    row = await db.get_user_info(user.id, user.username or "")
-    role = row["role"]
-    daily_used = row["daily_used"]
-    limit = ROLE_LIMITS.get(role)
-
-    if limit is None:
-        remaining_str = "∞"
-        limit_str = "∞"
-    else:
-        remaining = max(0, limit - daily_used)
-        remaining_str = str(remaining)
-        limit_str = str(limit)
-
-    role_emoji = {"owner": "👑", "premium": "💎", "free": "🆓"}.get(role, "❓")
-
-    msg = (
-        "📊 *Your Daily Credits*\n"
-        "━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
-        "\n"
-        f"{role_emoji} Role: `{_escape_md(role)}`\n"
-        f"📈 Used today: `{daily_used}`\n"
-        f"📉 Remaining: `{_escape_md(remaining_str)}`\n"
-        f"🔄 Daily limit: `{_escape_md(limit_str)}`\n"
-        "\n"
-        "Credits reset at *00:00 UTC* daily\\.\n"
-        "━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-    )
-    await update.message.reply_text(msg, parse_mode=ParseMode.MARKDOWN_V2)
-
-
-# --------------- /role ---------------
-async def cmd_role(
-    update: Update, context: ContextTypes.DEFAULT_TYPE
-) -> None:
-    user = update.effective_user
-    row = await db.get_user_info(user.id, user.username or "")
-    role = row["role"]
-    limit = ROLE_LIMITS.get(role)
-
-    role_emoji = {"owner": "👑", "premium": "💎", "free": "🆓"}.get(role, "❓")
-    limit_str = str(limit) if limit is not None else "Unlimited"
-
-    msg = (
-        f"{role_emoji} *Your Role: {_escape_md(role.capitalize())}*\n"
-        f"Daily limit: `{_escape_md(limit_str)}`\n"
-    )
-    await update.message.reply_text(msg, parse_mode=ParseMode.MARKDOWN_V2)
-
-
-# --------------- /price ---------------
-@check_credit
+@require_credits
 async def cmd_price(
     update: Update, context: ContextTypes.DEFAULT_TYPE
 ) -> None:
-    await update.message.reply_text("Fetching latest XAU/USD price...")
+    await update.message.reply_text(
+        "Fetching latest XAU/USD price..."
+    )
 
     try:
         await twelvedata_limiter.acquire()
@@ -1534,28 +1780,36 @@ async def cmd_price(
 
         if price_data is None:
             await update.message.reply_text(
-                "⚠️ All data providers are currently busy. "
-                "Please try again later."
+                "Failed to fetch price data. "
+                "All API keys may be exhausted. Please try again later."
             )
             return
 
         price = price_data["price"]
         timestamp = price_data["timestamp"]
 
+        credit_line = build_credit_footer_escaped(context)
+
         msg = (
-            "🥇 *XAU/USD \\- Live Price*\n"
-            "━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+            "\U0001f947 *XAU/USD \\- Live Price*\n"
+            "\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501"
+            "\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501"
+            "\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\n"
             "\n"
-            f"💰 *Price:* `${price:,.2f}`\n"
-            f"🕐 *Time:*  `{timestamp}`\n"
+            f"\U0001f4b0 *Price:* `${price:,.2f}`\n"
+            f"\U0001f550 *Time:*  `{timestamp}`\n"
             "\n"
-            "━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+            "\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501"
+            "\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501"
+            "\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501"
+            f"\n{credit_line}"
         )
         await update.message.reply_text(
             msg, parse_mode=ParseMode.MARKDOWN_V2
         )
         logger.info(
-            f"Price sent to user {update.effective_user.id}: ${price:.2f}"
+            f"Price sent to user {update.effective_user.id}: "
+            f"${price:.2f}"
         )
 
     except Exception as e:
@@ -1565,8 +1819,7 @@ async def cmd_price(
         )
 
 
-# --------------- /analysis ---------------
-@check_credit
+@require_credits
 async def cmd_analysis(
     update: Update, context: ContextTypes.DEFAULT_TYPE
 ) -> None:
@@ -1591,8 +1844,8 @@ async def cmd_analysis(
 
         if df is None or len(df) < 50:
             await loading_msg.edit_text(
-                "⚠️ All data providers are currently busy or returned "
-                "insufficient data. Please try again later."
+                "Failed to fetch sufficient market data. "
+                "Please try again."
             )
             return
 
@@ -1624,17 +1877,21 @@ async def cmd_analysis(
             datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
         )
 
+        credit_line = build_credit_footer_escaped(context)
+
         msg = (
-            f"🥇 *XAU/USD Analysis \\({tf_escaped}\\)*\n"
-            "━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+            f"\U0001f947 *XAU/USD Analysis \\({tf_escaped}\\)*\n"
+            "\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501"
+            "\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501"
+            "\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\n"
             "\n"
-            "📊 *PRICE ACTION*\n"
+            "\U0001f4ca *PRICE ACTION*\n"
             f"Price: `${latest['close']:,.2f}`\n"
             f"Open: `${latest['open']:,.2f}`\n"
             f"High: `${latest['high']:,.2f}`\n"
             f"Low:  `${latest['low']:,.2f}`\n"
             "\n"
-            "📈 *TECHNICAL INDICATORS*\n"
+            "\U0001f4c8 *TECHNICAL INDICATORS*\n"
             f"RSI \\(14\\):  `{indicators.rsi}` \\- {rsi_interp}\n"
             f"EMA 20:    `{indicators.ema_20}`\n"
             f"EMA 50:    `{indicators.ema_50}`\n"
@@ -1643,11 +1900,11 @@ async def cmd_analysis(
             f"ATR \\(14\\):  `{indicators.atr}`\n"
             f"Volatility: {vol_cond}\n"
             "\n"
-            "🛡 *KEY LEVELS*\n"
+            "\U0001f6e1 *KEY LEVELS*\n"
             f"Support:    `${indicators.support:,.2f}`\n"
             f"Resistance: `${indicators.resistance:,.2f}`\n"
             "\n"
-            "🤖 *AI ANALYSIS*\n"
+            "\U0001f916 *AI ANALYSIS*\n"
             f"Bias:     {ai_bias}\n"
             f"Trade:    {ai_trade}\n"
             f"Entry:    `{ai_entry}`\n"
@@ -1655,17 +1912,22 @@ async def cmd_analysis(
             f"TP1:      `{ai_tp1}`\n"
             f"TP2:      `{ai_tp2}`\n"
             "\n"
-            f"⚠️ *Risk:* {ai_risk}\n"
-            f"🔮 *Outlook:* {ai_outlook}\n"
+            f"\u26a0\ufe0f *Risk:* {ai_risk}\n"
+            f"\U0001f52e *Outlook:* {ai_outlook}\n"
             "\n"
-            "━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
-            f"_{now_str}_\n"
+            "\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501"
+            "\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501"
+            "\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\n"
+            f"_\\{now_str}_\n"
             "_Not financial advice\\. Trade at your own risk\\._"
+            f"\n{credit_line}"
         )
         await loading_msg.edit_text(
             msg, parse_mode=ParseMode.MARKDOWN_V2
         )
-        logger.info(f"Analysis delivered to user {update.effective_user.id}")
+        logger.info(
+            f"Analysis delivered to user {update.effective_user.id}"
+        )
 
     except Exception as e:
         logger.error(f"Analysis command error: {e}", exc_info=True)
@@ -1674,8 +1936,7 @@ async def cmd_analysis(
         )
 
 
-# --------------- /chart ---------------
-@check_credit
+@require_credits
 async def cmd_chart(
     update: Update, context: ContextTypes.DEFAULT_TYPE
 ) -> None:
@@ -1698,8 +1959,7 @@ async def cmd_chart(
 
         if df is None or len(df) < 20:
             await loading_msg.edit_text(
-                "⚠️ All data providers are currently busy or returned "
-                "insufficient data. Please try again later."
+                "Insufficient data for chart generation."
             )
             return
 
@@ -1717,16 +1977,24 @@ async def cmd_chart(
             await loading_msg.edit_text("Chart generation failed.")
             return
 
-        now_str = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+        now_str = datetime.now(timezone.utc).strftime(
+            "%Y-%m-%d %H:%M UTC"
+        )
+
+        credit_footer = build_credit_footer(context)
+
         caption = (
             f"XAU/USD - {tf.display_name} Chart\n"
             f"Price: ${df.iloc[-1]['close']:,.2f}\n"
             f"RSI: {indicators.rsi} | ATR: {indicators.atr}\n"
             f"{now_str}"
+            f"{credit_footer}"
         )
 
         await loading_msg.delete()
-        await update.message.reply_photo(photo=chart_buf, caption=caption)
+        await update.message.reply_photo(
+            photo=chart_buf, caption=caption
+        )
         logger.info(f"Chart sent to user {update.effective_user.id}")
 
     except Exception as e:
@@ -1736,7 +2004,6 @@ async def cmd_chart(
         )
 
 
-# --------------- /timeframe ---------------
 async def cmd_timeframe(
     update: Update, context: ContextTypes.DEFAULT_TYPE
 ) -> None:
@@ -1782,78 +2049,143 @@ async def cmd_timeframe(
         parse_mode=ParseMode.MARKDOWN_V2,
     )
     logger.info(
-        f"User {update.effective_user.id} changed timeframe to {new_tf.value}"
+        f"User {update.effective_user.id} changed timeframe "
+        f"to {new_tf.value}"
     )
 
 
 # =============================================================================
-# MODULE 9: ADMIN COMMANDS (Owner only)
+# MODULE 5B: USER STATUS COMMAND
 # =============================================================================
+async def cmd_mystatus(
+    update: Update, context: ContextTypes.DEFAULT_TYPE
+) -> None:
+    user = update.effective_user
+    record = await credit_manager.get_or_create_user(user.id, user.username)
 
-@_owner_only
+    role_display = record.role.capitalize()
+    if record.role == "owner":
+        limit_display = "∞ (Unlimited)"
+        remaining_display = "∞"
+        used_display = str(record.daily_used)
+    else:
+        limit = CREDIT_LIMITS.get(record.role, 5)
+        today = date.today()
+        used = record.daily_used if record.last_reset >= today else 0
+        remaining = max(0, limit - used)
+        limit_display = str(limit)
+        remaining_display = str(remaining)
+        used_display = str(used)
+
+    role_emoji = {
+        "owner": "👑",
+        "premium": "⭐",
+        "free": "🆓",
+    }.get(record.role, "🆓")
+
+    msg = (
+        f"👤 *Your Account Status*\n"
+        f"━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+        f"\n"
+        f"{role_emoji} *Role:* {_escape_md(role_display)}\n"
+        f"🆔 *ID:* `{user.id}`\n"
+        f"📛 *Username:* @{_escape_md(user.username or 'N/A')}\n"
+        f"\n"
+        f"📊 *Daily Credits*\n"
+        f"Used: {_escape_md(used_display)}\n"
+        f"Limit: {_escape_md(limit_display)}\n"
+        f"Remaining: {_escape_md(remaining_display)}\n"
+        f"\n"
+        f"🕐 Resets daily at 00:00 UTC\n"
+        f"━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+    )
+    await update.message.reply_text(msg, parse_mode=ParseMode.MARKDOWN_V2)
+
+
+# =============================================================================
+# MODULE 5C: ADMIN COMMANDS (OWNER ONLY)
+# =============================================================================
+@owner_only
 async def cmd_addprem(
     update: Update, context: ContextTypes.DEFAULT_TYPE
 ) -> None:
-    """Promote a user to premium. Usage: /addprem <user_id>"""
     if not context.args:
         await update.message.reply_text(
-            "Usage: /addprem <user_id>\nExample: /addprem 123456789"
+            "Usage: /addprem <telegram_id>\n"
+            "Example: /addprem 123456789"
         )
         return
 
     try:
         target_id = int(context.args[0])
     except ValueError:
-        await update.message.reply_text("Invalid user ID. Must be a number.")
+        await update.message.reply_text(
+            "❌ Invalid Telegram ID. Must be a number."
+        )
         return
 
-    if target_id == OWNER_USER_ID:
-        await update.message.reply_text("Cannot modify the owner role.")
-        return
-
-    await db.set_role(target_id, "premium")
+    success, msg = await credit_manager.set_premium(target_id)
+    await update.message.reply_text(msg, parse_mode=ParseMode.MARKDOWN)
     logger.info(
-        f"Owner promoted user {target_id} to premium"
-    )
-    await update.message.reply_text(
-        f"✅ User `{target_id}` is now *Premium* \\(50/day\\)\\.",
-        parse_mode=ParseMode.MARKDOWN_V2,
+        f"ADMIN addprem: target={target_id} success={success} "
+        f"by owner {update.effective_user.id}"
     )
 
 
-@_owner_only
+@owner_only
 async def cmd_delprem(
     update: Update, context: ContextTypes.DEFAULT_TYPE
 ) -> None:
-    """Demote a user to free. Usage: /delprem <user_id>"""
     if not context.args:
         await update.message.reply_text(
-            "Usage: /delprem <user_id>\nExample: /delprem 123456789"
+            "Usage: /delprem <telegram_id>\n"
+            "Example: /delprem 123456789"
         )
         return
 
     try:
         target_id = int(context.args[0])
     except ValueError:
-        await update.message.reply_text("Invalid user ID. Must be a number.")
+        await update.message.reply_text(
+            "❌ Invalid Telegram ID. Must be a number."
+        )
         return
 
-    if target_id == OWNER_USER_ID:
-        await update.message.reply_text("Cannot modify the owner role.")
-        return
-
-    await db.set_role(target_id, "free")
+    success, msg = await credit_manager.remove_premium(target_id)
+    await update.message.reply_text(msg, parse_mode=ParseMode.MARKDOWN)
     logger.info(
-        f"Owner demoted user {target_id} to free"
+        f"ADMIN delprem: target={target_id} success={success} "
+        f"by owner {update.effective_user.id}"
     )
-    await update.message.reply_text(
-        f"✅ User `{target_id}` is now *Free* \\(5/day\\)\\.",
-        parse_mode=ParseMode.MARKDOWN_V2,
+
+
+@owner_only
+async def cmd_botstats(
+    update: Update, context: ContextTypes.DEFAULT_TYPE
+) -> None:
+    """Show bot statistics (owner only)."""
+    stats = await credit_manager.get_stats()
+    key_info = (
+        f"Active key: #{td_client._current_key_index + 1}"
+        f"/{len(td_client._api_keys)}"
     )
+
+    msg = (
+        f"📈 *Bot Statistics*\n"
+        f"━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+        f"\n"
+        f"👥 Total users: {stats['total_users']}\n"
+        f"⭐ Premium users: {stats['premium_users']}\n"
+        f"📊 Active today: {stats['active_today']}\n"
+        f"\n"
+        f"🔑 {_escape_md(key_info)}\n"
+        f"━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+    )
+    await update.message.reply_text(msg, parse_mode=ParseMode.MARKDOWN_V2)
 
 
 # =============================================================================
-# MODULE 10: ERROR HANDLER
+# MODULE 6: ERROR HANDLER
 # =============================================================================
 async def error_handler(
     update: object, context: ContextTypes.DEFAULT_TYPE
@@ -1872,21 +2204,20 @@ async def error_handler(
 
 
 # =============================================================================
-# MODULE 11: APPLICATION LIFECYCLE
+# MODULE 7: MAIN ENTRY POINT
 # =============================================================================
 async def post_init(application: Application) -> None:
-    # Connect to PostgreSQL
-    await db.connect()
+    # Initialize database connection pool and schema
+    await credit_manager.initialize()
+    logger.info("CreditManager initialized successfully")
 
-    # Register bot commands with Telegram
     commands = [
         BotCommand("start", "Welcome message"),
         BotCommand("price", "Latest XAU/USD price"),
         BotCommand("analysis", "Full AI technical analysis"),
         BotCommand("chart", "Technical analysis chart"),
         BotCommand("timeframe", "Change timeframe"),
-        BotCommand("credits", "Check remaining daily credits"),
-        BotCommand("role", "Show your current role"),
+        BotCommand("mystatus", "Your credit status"),
         BotCommand("help", "Show all commands"),
     ]
     await application.bot.set_my_commands(commands)
@@ -1894,15 +2225,17 @@ async def post_init(application: Application) -> None:
 
 
 async def post_shutdown(application: Application) -> None:
-    await db.close()
-    logger.info("Application shutdown complete.")
+    await credit_manager.close()
+    logger.info("CreditManager pool closed on shutdown")
 
 
 def main() -> None:
     logger.info("=" * 60)
-    logger.info("  XAUUSD AI ANALYSIS BOT v3.0 - Starting...")
-    logger.info(f"  TwelveData keys loaded: {len(TWELVEDATA_API_KEYS)}")
-    logger.info(f"  Owner: {OWNER_USER_ID} (@{OWNER_USERNAME})")
+    logger.info("  XAUUSD AI ANALYSIS BOT v2.1 - Starting...")
+    logger.info("  SDK: google-genai (new)")
+    logger.info(f"  TwelveData keys: {len(TWELVEDATA_API_KEYS)}")
+    logger.info(f"  Database: {'configured' if DATABASE_URL else 'MISSING'}")
+    logger.info(f"  Owner: {OWNER_USERNAME} ({OWNER_TELEGRAM_ID})")
     logger.info("=" * 60)
 
     app = (
@@ -1916,25 +2249,22 @@ def main() -> None:
         .build()
     )
 
-    # Public commands
+    # Standard commands
     app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(CommandHandler("help", cmd_help))
-    app.add_handler(CommandHandler("credits", cmd_credits))
-    app.add_handler(CommandHandler("role", cmd_role))
-    app.add_handler(CommandHandler("timeframe", cmd_timeframe))
-
-    # Credit-gated commands
     app.add_handler(CommandHandler("price", cmd_price))
     app.add_handler(CommandHandler("analysis", cmd_analysis))
     app.add_handler(CommandHandler("chart", cmd_chart))
+    app.add_handler(CommandHandler("timeframe", cmd_timeframe))
+    app.add_handler(CommandHandler("mystatus", cmd_mystatus))
 
     # Admin commands (owner only)
     app.add_handler(CommandHandler("addprem", cmd_addprem))
     app.add_handler(CommandHandler("addpremium", cmd_addprem))
     app.add_handler(CommandHandler("delprem", cmd_delprem))
     app.add_handler(CommandHandler("removepremium", cmd_delprem))
+    app.add_handler(CommandHandler("botstats", cmd_botstats))
 
-    # Global error handler
     app.add_error_handler(error_handler)
 
     logger.info("Bot polling for updates... Press Ctrl+C to stop.")
