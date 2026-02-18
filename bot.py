@@ -1,10 +1,11 @@
 #!/usr/bin/env python3
 """
 ╔══════════════════════════════════════════════════════════════════════╗
-║                    XAUUSD AI ANALYSIS BOT v2.1                     ║
+║                    XAUUSD AI ANALYSIS BOT v3.0                     ║
 ║                                                                    ║
 ║  Production-ready Telegram bot for XAU/USD technical analysis      ║
 ║  Uses: google-genai SDK, Twelve Data, python-telegram-bot          ║
+║  NEW: Credit system, roles, PostgreSQL, admin commands             ║
 ╚══════════════════════════════════════════════════════════════════════╝
 """
 
@@ -43,6 +44,11 @@ from telegram.ext import (
 )
 from telegram.constants import ParseMode
 
+# Credit system modules
+import db
+from credit_manager import require_credit, OWNER_ID, is_owner
+import admin_commands
+
 # =============================================================================
 # CONFIGURATION & ENVIRONMENT
 # =============================================================================
@@ -51,6 +57,7 @@ load_dotenv()
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 TWELVEDATA_API_KEY = os.getenv("TWELVEDATA_API_KEY")
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
+# DATABASE_URL is read inside db.py
 
 _missing = []
 if not TELEGRAM_BOT_TOKEN:
@@ -59,10 +66,12 @@ if not TWELVEDATA_API_KEY:
     _missing.append("TWELVEDATA_API_KEY")
 if not GEMINI_API_KEY:
     _missing.append("GEMINI_API_KEY")
+if not os.getenv("DATABASE_URL"):
+    _missing.append("DATABASE_URL")
 if _missing:
     raise EnvironmentError(
         f"Missing required environment variables: {', '.join(_missing)}. "
-        f"Please set them in your .env file."
+        f"Please set them in your .env file or Railway dashboard."
     )
 
 # =============================================================================
@@ -76,6 +85,7 @@ logging.basicConfig(
 logging.getLogger("httpx").setLevel(logging.WARNING)
 logging.getLogger("telegram.ext").setLevel(logging.WARNING)
 logging.getLogger("urllib3").setLevel(logging.WARNING)
+logging.getLogger("asyncpg").setLevel(logging.WARNING)
 
 logger = logging.getLogger("XAUUSD_Bot")
 
@@ -91,7 +101,7 @@ CHART_DPI = 150
 CHART_FIGSIZE = (14, 10)
 
 # =============================================================================
-# COLOR CONSTANTS (avoids string-literal issues)
+# COLOR CONSTANTS
 # =============================================================================
 COLOR_GREEN = "#26a69a"
 COLOR_RED = "#ef5350"
@@ -219,7 +229,7 @@ class TwelveDataClient:
     def __init__(self, api_key: str):
         self.api_key = api_key
         self.session = requests.Session()
-        self.session.headers.update({"User-Agent": "XAUUSD-AI-Bot/2.1"})
+        self.session.headers.update({"User-Agent": "XAUUSD-AI-Bot/3.0"})
 
     def fetch_time_series(
         self,
@@ -268,6 +278,12 @@ class TwelveDataClient:
                 subset=["open", "high", "low", "close"]
             ).reset_index(drop=True)
             logger.info(f"Fetched {len(df)} candles for {SYMBOL}")
+
+            # Track API call
+            asyncio.get_event_loop().create_task(
+                db.increment_api_counter("twelvedata_calls")
+            )
+
             return df
 
         except requests.exceptions.Timeout:
@@ -294,6 +310,12 @@ class TwelveDataClient:
             if "price" not in data:
                 logger.error(f"No price in response: {data}")
                 return None
+
+            # Track API call
+            asyncio.get_event_loop().create_task(
+                db.increment_api_counter("twelvedata_calls")
+            )
+
             return {
                 "price": float(data["price"]),
                 "timestamp": datetime.now(timezone.utc).strftime(
@@ -501,7 +523,7 @@ ta_engine = TechnicalAnalysisEngine()
 
 
 # =============================================================================
-# MODULE 3: GEMINI AI ANALYSIS (NEW google-genai SDK)
+# MODULE 3: GEMINI AI ANALYSIS
 # =============================================================================
 class GeminiAnalyzer:
 
@@ -546,6 +568,14 @@ class GeminiAnalyzer:
                         max_output_tokens=1024,
                     ),
                 )
+
+                # Track Gemini API call
+                try:
+                    asyncio.get_event_loop().create_task(
+                        db.increment_api_counter("gemini_calls")
+                    )
+                except RuntimeError:
+                    pass  # No running loop in executor thread
 
                 raw_text = response.text
 
@@ -889,9 +919,7 @@ class ChartGenerator:
                 y=0.98,
             )
 
-            # =============================================================
             # Panel 1: Price Action + EMAs + Support/Resistance
-            # =============================================================
             ax1 = axes[0]
 
             ax1.plot(
@@ -910,7 +938,6 @@ class ChartGenerator:
                 color=COLOR_GOLD,
             )
 
-            # Candlestick-style bars
             for idx_val, row in plot_df.iterrows():
                 if row["close"] >= row["open"]:
                     bar_color = COLOR_GREEN
@@ -933,7 +960,6 @@ class ChartGenerator:
                     linewidth=2.5,
                 )
 
-            # EMA lines
             if "ema_20" in plot_df.columns:
                 ema20_label = f"EMA 20 ({indicators.ema_20:.2f})"
                 ax1.plot(
@@ -957,7 +983,6 @@ class ChartGenerator:
                     alpha=0.9,
                 )
 
-            # Support line
             support_label = f"Support ({indicators.support:.2f})"
             ax1.axhline(
                 y=indicators.support,
@@ -968,7 +993,6 @@ class ChartGenerator:
                 label=support_label,
             )
 
-            # Resistance line
             resistance_label = f"Resistance ({indicators.resistance:.2f})"
             ax1.axhline(
                 y=indicators.resistance,
@@ -983,9 +1007,7 @@ class ChartGenerator:
             ax1.legend(loc="upper left", fontsize=8, framealpha=0.3)
             ax1.grid(True, alpha=0.15)
 
-            # =============================================================
             # Panel 2: RSI
-            # =============================================================
             ax2 = axes[1]
 
             if "rsi" in plot_df.columns:
@@ -1013,7 +1035,6 @@ class ChartGenerator:
                     alpha=0.2,
                     color=COLOR_RED,
                 )
-                # Overbought line at 70
                 ax2.axhline(
                     y=70,
                     color=COLOR_RED_BRIGHT,
@@ -1021,7 +1042,6 @@ class ChartGenerator:
                     linewidth=0.8,
                     alpha=0.6,
                 )
-                # Oversold line at 30
                 ax2.axhline(
                     y=30,
                     color=COLOR_GREEN_BRIGHT,
@@ -1029,7 +1049,6 @@ class ChartGenerator:
                     linewidth=0.8,
                     alpha=0.6,
                 )
-                # Midline at 50
                 ax2.axhline(
                     y=50,
                     color=COLOR_GRAY,
@@ -1043,9 +1062,7 @@ class ChartGenerator:
             ax2.legend(loc="upper left", fontsize=8, framealpha=0.3)
             ax2.grid(True, alpha=0.15)
 
-            # =============================================================
             # Panel 3: MACD
-            # =============================================================
             ax3 = axes[2]
 
             if "macd_line" in plot_df.columns:
@@ -1064,7 +1081,6 @@ class ChartGenerator:
                     label="Signal",
                 )
 
-                # Histogram bars
                 hist_colors = []
                 for v in plot_df["macd_histogram"]:
                     if v >= 0:
@@ -1091,13 +1107,11 @@ class ChartGenerator:
             ax3.legend(loc="upper left", fontsize=8, framealpha=0.3)
             ax3.grid(True, alpha=0.15)
 
-            # X-axis formatting
             ax3.xaxis.set_major_formatter(
                 mdates.DateFormatter("%m/%d %H:%M")
             )
             plt.xticks(rotation=45, fontsize=8)
 
-            # Timestamp watermark
             now_str = datetime.now(timezone.utc).strftime(
                 "%Y-%m-%d %H:%M UTC"
             )
@@ -1114,7 +1128,6 @@ class ChartGenerator:
 
             plt.tight_layout()
 
-            # Save to buffer
             buf = io.BytesIO()
             fig.savefig(
                 buf,
@@ -1165,19 +1178,40 @@ def _escape_md(text: str) -> str:
 async def cmd_start(
     update: Update, context: ContextTypes.DEFAULT_TYPE
 ) -> None:
+    user = update.effective_user
+
+    # Register user in DB on /start
+    user_data = await db.get_or_create_user(user.id, user.username)
+    role = user_data["role"]
+    limit = user_data["daily_limit"]
+
+    # Auto-set owner role if this is the owner's first interaction
+    if user.id == OWNER_ID and role != "owner":
+        await db.set_role(user.id, "owner", 999999)
+        role = "owner"
+        limit = 999999
+        logger.info("Owner role auto-assigned on /start")
+
+    if role == "owner":
+        role_line = "👑 Role: *Owner* \\(Unlimited\\)"
+    elif role == "premium":
+        role_line = f"💎 Role: *Premium* \\({limit} cmds/day\\)"
+    else:
+        role_line = f"🆓 Role: *Free* \\({limit} cmds/day\\)"
+
     welcome = (
-        "\U0001f947 *XAUUSD AI Analysis Bot*\n"
-        "\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501"
-        "\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501"
-        "\u2501\u2501\u2501\u2501\u2501\u2501\u2501\n"
+        "🥇 *XAUUSD AI Analysis Bot*\n"
+        "━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
         "\n"
         "Welcome\\! I provide real\\-time AI\\-powered "
         "technical analysis for *Gold \\(XAU/USD\\)*\\.\n"
         "\n"
-        "\U0001f539 Real\\-time price data from Twelve Data\n"
-        "\U0001f539 Technical indicators \\(RSI, EMA, MACD, ATR\\)\n"
-        "\U0001f539 AI analysis powered by Google Gemini\n"
-        "\U0001f539 Professional chart generation\n"
+        f"{role_line}\n"
+        "\n"
+        "🔹 Real\\-time price data from Twelve Data\n"
+        "🔹 Technical indicators \\(RSI, EMA, MACD, ATR\\)\n"
+        "🔹 AI analysis powered by Google Gemini\n"
+        "🔹 Professional chart generation\n"
         "\n"
         "*Available Commands:*\n"
         "/price \\- Latest XAU/USD price\n"
@@ -1185,32 +1219,30 @@ async def cmd_start(
         "/chart \\- Technical analysis chart\n"
         "/timeframe \\- Change timeframe "
         "\\(e\\.g\\. `/timeframe 1h`\\)\n"
+        "/credits \\- Check remaining credits\n"
         "/help \\- Show all commands\n"
         "\n"
         "Default timeframe: *15 Min*\n"
-        "\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501"
-        "\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501"
-        "\u2501\u2501\u2501\u2501\u2501\u2501\u2501\n"
+        "━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
         "_Disclaimer: Not financial advice\\. Trade responsibly\\._"
     )
     await update.message.reply_text(welcome, parse_mode=ParseMode.MARKDOWN_V2)
-    logger.info(f"User {update.effective_user.id} started the bot")
+    logger.info(f"User {user.id} started the bot (role={role})")
 
 
 async def cmd_help(
     update: Update, context: ContextTypes.DEFAULT_TYPE
 ) -> None:
     help_text = (
-        "\U0001f539 *Bot Commands*\n"
-        "\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501"
-        "\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501"
-        "\u2501\u2501\u2501\u2501\u2501\u2501\u2501\n"
+        "🔹 *Bot Commands*\n"
+        "━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
         "\n"
         "/start \\- Welcome message\n"
-        "/price \\- Latest XAU/USD price\n"
-        "/analysis \\- Full AI technical analysis\n"
-        "/chart \\- Send technical chart\n"
-        "/timeframe <tf> \\- Change timeframe\n"
+        "/price \\- Latest XAU/USD price \\(1 credit\\)\n"
+        "/analysis \\- Full AI technical analysis \\(1 credit\\)\n"
+        "/chart \\- Send technical chart \\(1 credit\\)\n"
+        "/timeframe <tf> \\- Change timeframe \\(free\\)\n"
+        "/credits \\- Check remaining daily credits\n"
         "\n"
         "*Timeframe Options:*\n"
         "  `5m`  \\- 5 Minutes\n"
@@ -1222,15 +1254,62 @@ async def cmd_help(
         "*Example:* `/timeframe 4h`\n"
         "\n"
         "/help \\- This message\n"
-        "\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501"
-        "\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501"
-        "\u2501\u2501\u2501\u2501\u2501\u2501\u2501"
+        "━━━━━━━━━━━━━━━━━━━━━━━━━━━"
     )
     await update.message.reply_text(
         help_text, parse_mode=ParseMode.MARKDOWN_V2
     )
 
 
+async def cmd_credits(
+    update: Update, context: ContextTypes.DEFAULT_TYPE
+) -> None:
+    """Show the user their remaining credits for the day."""
+    user = update.effective_user
+    user_data = await db.get_or_create_user(user.id, user.username)
+    user_data = await db.reset_daily_if_needed(user.id)
+
+    role = user_data["role"]
+    used = user_data["daily_used"]
+    limit = user_data["daily_limit"]
+
+    if user.id == OWNER_ID or role == "owner":
+        msg = (
+            "👑 *Credit Status*\n"
+            "━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+            "\n"
+            "Role: *Owner*\n"
+            "Credits: *Unlimited* ♾\n"
+            "\n"
+            "━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+        )
+    else:
+        remaining = max(0, limit - used)
+        if role == "premium":
+            role_emoji = "💎"
+            role_name = "Premium"
+        else:
+            role_emoji = "🆓"
+            role_name = "Free"
+
+        msg = (
+            f"{role_emoji} *Credit Status*\n"
+            "━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+            "\n"
+            f"Role: *{_escape_md(role_name)}*\n"
+            f"Used Today: `{used}/{limit}`\n"
+            f"Remaining: *{remaining}*\n"
+            "\n"
+            "Resets daily at `00:00 UTC`\n"
+            "━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+        )
+
+    await update.message.reply_text(
+        msg, parse_mode=ParseMode.MARKDOWN_V2
+    )
+
+
+@require_credit
 async def cmd_price(
     update: Update, context: ContextTypes.DEFAULT_TYPE
 ) -> None:
@@ -1255,17 +1334,13 @@ async def cmd_price(
         timestamp = price_data["timestamp"]
 
         msg = (
-            "\U0001f947 *XAU/USD \\- Live Price*\n"
-            "\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501"
-            "\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501"
-            "\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\n"
+            "🥇 *XAU/USD \\- Live Price*\n"
+            "━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
             "\n"
-            f"\U0001f4b0 *Price:* `${price:,.2f}`\n"
-            f"\U0001f550 *Time:*  `{timestamp}`\n"
+            f"💰 *Price:* `${price:,.2f}`\n"
+            f"🕐 *Time:*  `{timestamp}`\n"
             "\n"
-            "\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501"
-            "\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501"
-            "\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501"
+            "━━━━━━━━━━━━━━━━━━━━━━━━━━━"
         )
         await update.message.reply_text(
             msg, parse_mode=ParseMode.MARKDOWN_V2
@@ -1282,6 +1357,7 @@ async def cmd_price(
         )
 
 
+@require_credit
 async def cmd_analysis(
     update: Update, context: ContextTypes.DEFAULT_TYPE
 ) -> None:
@@ -1344,18 +1420,16 @@ async def cmd_analysis(
         )
 
         msg = (
-            f"\U0001f947 *XAU/USD Analysis \\({tf_escaped}\\)*\n"
-            "\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501"
-            "\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501"
-            "\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\n"
+            f"🥇 *XAU/USD Analysis \\({tf_escaped}\\)*\n"
+            "━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
             "\n"
-            "\U0001f4ca *PRICE ACTION*\n"
+            "📊 *PRICE ACTION*\n"
             f"Price: `${latest['close']:,.2f}`\n"
             f"Open: `${latest['open']:,.2f}`\n"
             f"High: `${latest['high']:,.2f}`\n"
             f"Low:  `${latest['low']:,.2f}`\n"
             "\n"
-            "\U0001f4c8 *TECHNICAL INDICATORS*\n"
+            "📈 *TECHNICAL INDICATORS*\n"
             f"RSI \\(14\\):  `{indicators.rsi}` \\- {rsi_interp}\n"
             f"EMA 20:    `{indicators.ema_20}`\n"
             f"EMA 50:    `{indicators.ema_50}`\n"
@@ -1364,11 +1438,11 @@ async def cmd_analysis(
             f"ATR \\(14\\):  `{indicators.atr}`\n"
             f"Volatility: {vol_cond}\n"
             "\n"
-            "\U0001f6e1 *KEY LEVELS*\n"
+            "🛡 *KEY LEVELS*\n"
             f"Support:    `${indicators.support:,.2f}`\n"
             f"Resistance: `${indicators.resistance:,.2f}`\n"
             "\n"
-            "\U0001f916 *AI ANALYSIS*\n"
+            "🤖 *AI ANALYSIS*\n"
             f"Bias:     {ai_bias}\n"
             f"Trade:    {ai_trade}\n"
             f"Entry:    `{ai_entry}`\n"
@@ -1376,12 +1450,10 @@ async def cmd_analysis(
             f"TP1:      `{ai_tp1}`\n"
             f"TP2:      `{ai_tp2}`\n"
             "\n"
-            f"\u26a0\ufe0f *Risk:* {ai_risk}\n"
-            f"\U0001f52e *Outlook:* {ai_outlook}\n"
+            f"⚠️ *Risk:* {ai_risk}\n"
+            f"🔮 *Outlook:* {ai_outlook}\n"
             "\n"
-            "\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501"
-            "\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501"
-            "\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\n"
+            "━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
             f"_\\{now_str}_\n"
             "_Not financial advice\\. Trade at your own risk\\._"
         )
@@ -1399,6 +1471,7 @@ async def cmd_analysis(
         )
 
 
+@require_credit
 async def cmd_chart(
     update: Update, context: ContextTypes.DEFAULT_TYPE
 ) -> None:
@@ -1535,40 +1608,72 @@ async def error_handler(
 # MODULE 7: MAIN ENTRY POINT
 # =============================================================================
 async def post_init(application: Application) -> None:
+    # Initialise the database pool
+    await db.init_pool()
+    logger.info("Database pool initialised in post_init")
+
+    # Auto-register owner in DB
+    await db.get_or_create_user(OWNER_ID, "EK_HENG")
+    await db.set_role(OWNER_ID, "owner", 999999)
+    logger.info(f"Owner {OWNER_ID} registered with unlimited access")
+
     commands = [
         BotCommand("start", "Welcome message"),
         BotCommand("price", "Latest XAU/USD price"),
         BotCommand("analysis", "Full AI technical analysis"),
         BotCommand("chart", "Technical analysis chart"),
         BotCommand("timeframe", "Change timeframe"),
+        BotCommand("credits", "Check remaining credits"),
         BotCommand("help", "Show all commands"),
     ]
     await application.bot.set_my_commands(commands)
     logger.info("Bot commands registered with Telegram")
 
 
+async def post_shutdown(application: Application) -> None:
+    """Gracefully close DB pool on shutdown."""
+    await db.close_pool()
+    logger.info("Graceful shutdown complete")
+
+
 def main() -> None:
     logger.info("=" * 60)
-    logger.info("  XAUUSD AI ANALYSIS BOT v2.1 - Starting...")
+    logger.info("  XAUUSD AI ANALYSIS BOT v3.0 - Starting...")
     logger.info("  SDK: google-genai (new)")
+    logger.info("  Database: PostgreSQL (Railway)")
+    logger.info("  Credit System: ACTIVE")
     logger.info("=" * 60)
 
     app = (
         Application.builder()
         .token(TELEGRAM_BOT_TOKEN)
         .post_init(post_init)
+        .post_shutdown(post_shutdown)
         .read_timeout(30)
         .write_timeout(30)
         .connect_timeout(30)
         .build()
     )
 
+    # ── User commands ──────────────────────────────────────────────
     app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(CommandHandler("help", cmd_help))
+    app.add_handler(CommandHandler("credits", cmd_credits))
     app.add_handler(CommandHandler("price", cmd_price))
     app.add_handler(CommandHandler("analysis", cmd_analysis))
     app.add_handler(CommandHandler("chart", cmd_chart))
     app.add_handler(CommandHandler("timeframe", cmd_timeframe))
+
+    # ── Admin commands (owner only) ────────────────────────────────
+    app.add_handler(CommandHandler("addprem", admin_commands.cmd_addprem))
+    app.add_handler(CommandHandler("addpremium", admin_commands.cmd_addprem))
+    app.add_handler(CommandHandler("delprem", admin_commands.cmd_delprem))
+    app.add_handler(
+        CommandHandler("removepremium", admin_commands.cmd_delprem)
+    )
+    app.add_handler(CommandHandler("botstats", admin_commands.cmd_botstats))
+
+    # ── Error handler ──────────────────────────────────────────────
     app.add_error_handler(error_handler)
 
     logger.info("Bot polling for updates... Press Ctrl+C to stop.")
