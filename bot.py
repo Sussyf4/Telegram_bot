@@ -923,7 +923,7 @@ async def _check_credits(update: Update, cmd: str) -> bool:
     ok, rem, lim = db.check_and_use_credit(uid)
     if not ok:
         prem = db.is_premium(uid)
-        tier = "Premium" if prem else "Free"
+        tier = "Premium" if prem else "Free User"
         msg = (
             f"\u26d4 *Daily Limit Reached*\n\n"
             f"Your *{_e(tier)}* plan: *{lim}* commands/day\\.\n"
@@ -1007,7 +1007,7 @@ async def cmd_credits(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         tier, rems, lims = "Owner \U0001f451", "Unlimited", "\u221e"
         bar = "\u2588" * 10
     else:
-        tier = "Premium \u2b50" if prem else "Free"
+        tier = "Premium \u2b50" if prem else "Free User"
         l = PREMIUM_DAILY_LIMIT if prem else NORMAL_DAILY_LIMIT
         r = max(0, l - used)
         rems, lims = str(r), str(l)
@@ -1031,7 +1031,7 @@ async def cmd_myid(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     _track(update)
     u = update.effective_user
     prem = db.is_premium(u.id)
-    role = "Owner \U0001f451" if u.id == OWNER_ID else ("Premium \u2b50" if prem else "Free")
+    role = "Owner \U0001f451" if u.id == OWNER_ID else ("Premium \u2b50" if prem else "Free User")
     await update.message.reply_text(
         f"\U0001f4cb *Your Info*\n\n"
         f"ID: `{u.id}`\n"
