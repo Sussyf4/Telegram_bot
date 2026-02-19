@@ -286,7 +286,7 @@ async def cmd_help(
     msg = (
         "🔹 <b>Bot Commands</b>\n"
         "━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
-        "<b>📊 Analysis:</b>\n"
+        "<b>📊 Analysis Commands:</b>\n"
         "/price — Live price "
         "<i>(1 credit)</i>\n"
         "/analysis — Full AI analysis "
@@ -295,18 +295,22 @@ async def cmd_help(
         "<i>(1 credit)</i>\n"
         "/fundamental — Fundamental data "
         "<i>(1 credit)</i>\n"
-        "/fullreport — Combined tech+fundamental "
-        "<i>(⭐ 4 credits)</i>\n\n"
-        "<b>⚙️ Settings:</b>\n"
-        "/timeframe &lt;tf&gt; — Change timeframe "
-        "<i>(free)</i>\n\n"
-        "<b>👤 Account:</b>\n"
-        "/credits — Daily credits <i>(free)</i>\n"
-        "/checkid — Account info <i>(free)</i>\n"
-        "/upgrade — Premium upgrade <i>(free)</i>\n\n"
+        "/fullreport — Combined tech + fundamental "
+        "<i>(<b>4 credits</b>)</i>\n\n"
+        "<b>⚙️ Settings (Free):</b>\n"
+        "/timeframe &lt;tf&gt; — Change timeframe\n\n"
+        "<b>👤 Account (Free):</b>\n"
+        "/credits — Daily credits remaining\n"
+        "/checkid — Account info &amp; Telegram ID\n"
+        "/upgrade — Premium upgrade info\n\n"
         f"<b>Symbols:</b>\n{symbols_text}\n\n"
         "<b>Timeframes:</b> "
         "<code>5m 15m 1h 4h 1d</code>\n\n"
+        "<b>Credit Costs:</b>\n"
+        "  /price, /analysis, /chart, /fundamental "
+        "→ 1 credit each\n"
+        "  /fullreport → <b>4 credits</b> "
+        "(chart + tech + fundamental + AI)\n"
         "━━━━━━━━━━━━━━━━━━━━━━━━━━━"
     )
     await update.message.reply_text(
@@ -375,7 +379,7 @@ async def cmd_fundamental(
 
 
 # ──────────────────────────────────────────────────
-# /fullreport — costs 4 credits
+# /fullreport — combined tech + fundamental
 # ──────────────────────────────────────────────────
 @require_credit(cost=4)
 async def cmd_fullreport(
@@ -383,8 +387,9 @@ async def cmd_fullreport(
 ) -> None:
     keyboard = build_symbol_keyboard("fullreport")
     await update.message.reply_text(
-        "📊 <b>Select symbol for full report</b>\n"
-        "💡 <i>This command costs 4 credits.</i>",
+        "📊 <b>Full Report</b> "
+        "(costs <b>4 credits</b>)\n"
+        "Select symbol:",
         parse_mode=ParseMode.HTML,
         reply_markup=keyboard,
     )
@@ -667,7 +672,9 @@ async def _execute_fullreport(
         f"📊 Generating full report for "
         f"{symbol.emoji} {symbol.display_name} "
         f"({tf.display_name})...\n"
-        f"This may take 15-20 seconds."
+        f"⏳ This includes chart + technical + "
+        f"fundamental + AI analysis.\n"
+        f"Please wait 15-20 seconds."
     )
 
     try:
@@ -680,7 +687,9 @@ async def _execute_fullreport(
             md_client.fetch_time_series,
             symbol, tf.value, DEFAULT_OUTPUTSIZE,
         )
-        await db.increment_api_counter("twelvedata_calls")
+        await db.increment_api_counter(
+            "twelvedata_calls"
+        )
 
         if df is None or len(df) < 50:
             await query.edit_message_text(
@@ -706,7 +715,7 @@ async def _execute_fullreport(
         )
         await db.increment_api_counter("gemini_calls")
 
-        # Send chart first
+        # Generate chart
         chart_buf = await loop.run_in_executor(
             None,
             chart_gen.generate_chart,
@@ -720,12 +729,12 @@ async def _execute_fullreport(
                 photo=chart_buf,
                 caption=(
                     f"{symbol.emoji} "
-                    f"{symbol.display_name} "
-                    f"— {tf.display_name} Chart"
+                    f"{symbol.display_name} — "
+                    f"{tf.display_name} Chart"
                 ),
             )
 
-        # Then send full text report
+        # Full text report
         msg = _format_full_report_html(
             symbol, tf, ind, ai_result, fund
         )
@@ -738,7 +747,8 @@ async def _execute_fullreport(
 
     except Exception as exc:
         logger.error(
-            f"Full report error: {exc}", exc_info=True
+            f"Full report error: {exc}",
+            exc_info=True,
         )
         try:
             await query.edit_message_text(
@@ -767,6 +777,19 @@ def _format_analysis_html(
             "%Y-%m-%d %H:%M UTC"
         )
     )
+
+    # Determine trade direction emoji
+    if ai.trade_idea.strip().lower() in ("buy", "long"):
+        trade_emoji = "🟢"
+        direction = "BUY"
+    elif ai.trade_idea.strip().lower() in (
+        "sell", "short",
+    ):
+        trade_emoji = "🔴"
+        direction = "SELL"
+    else:
+        trade_emoji = "🟡"
+        direction = "WAIT"
 
     msg = (
         f"{symbol.emoji} <b>{h(symbol.display_name)} "
@@ -806,41 +829,49 @@ def _format_analysis_html(
         f"S2: <code>{ind.support_2}</code> "
         f"S3: <code>{ind.support_3}</code>\n"
         f"VPOC: <code>{ind.vpoc}</code>\n"
-        f"Fib 38.2%: <code>{ind.fib_382}</code> "
-        f"| 61.8%: <code>{ind.fib_618}</code>\n\n"
-        # Market Structure
+        f"Fib: 38.2% <code>{ind.fib_382}</code> "
+        f"| 61.8% <code>{ind.fib_618}</code>\n\n"
+        # Structure
         "🏗 <b>STRUCTURE</b>\n"
         f"{h(ind.market_structure)}\n\n"
         # Orderflow
         "🔄 <b>ORDERFLOW</b>\n"
         f"{h(ind.orderflow_bias)}\n\n"
-        # Overall Signal
-        "🎯 <b>SIGNAL: {bias} "
-        "({conf}% confidence)</b>\n"
-        f"💡 {h(ind.key_insight)}\n"
-        f"📋 {h(ind.action_levels)}\n\n"
-    ).format(
-        bias=h(ind.overall_bias),
-        conf=ind.confidence_score,
+        # Signal
+        f"🎯 <b>SIGNAL: {h(ind.overall_bias)} "
+        f"({ind.confidence_score}%)</b>\n"
+        f"💡 {h(ind.key_insight)}\n\n"
     )
 
-    # AI section
+    # AI Trade Plan — clean and validated
     msg += (
-        "🤖 <b>AI ANALYSIS</b>\n"
-        f"Bias: {h(ai.bias)}\n"
-        f"Trade: {h(ai.trade_idea)}\n"
-        f"Entry: <code>{h(ai.entry)}</code>\n"
-        f"SL: <code>{h(ai.stop_loss)}</code>\n"
-        f"TP1: <code>{h(ai.take_profit_1)}</code>\n"
-        f"TP2: <code>{h(ai.take_profit_2)}</code>\n"
-        f"⚠️ {h(ai.risk_note)}\n"
-        f"🔮 {h(ai.short_term_outlook)}\n"
+        f"{trade_emoji} <b>AI TRADE PLAN — "
+        f"{direction}</b>\n"
+        "┌─────────────────────────────┐\n"
+        f"│ Bias:  <b>{h(ai.bias)}</b>\n"
+        f"│ Trade: <b>{h(ai.trade_idea)}</b>\n"
+        f"│ Entry: <code>{h(ai.entry)}</code>\n"
+        f"│ SL:    <code>{h(ai.stop_loss)}</code>\n"
+        f"│ TP1:   <code>"
+        f"{h(ai.take_profit_1)}</code>\n"
+        f"│ TP2:   <code>"
+        f"{h(ai.take_profit_2)}</code>\n"
+        "└─────────────────────────────┘\n\n"
+        f"⚠️ <b>Risk:</b> {h(ai.risk_note)}\n"
+        f"🔮 <b>Outlook:</b> "
+        f"{h(ai.short_term_outlook)}\n"
     )
 
     if ai.fundamental_note != "N/A":
-        msg += f"🏦 {h(ai.fundamental_note)}\n"
+        msg += (
+            f"🏦 <b>Macro:</b> "
+            f"{h(ai.fundamental_note)}\n"
+        )
     if ai.combined_verdict != "N/A":
-        msg += f"✅ {h(ai.combined_verdict)}\n"
+        msg += (
+            f"✅ <b>Verdict:</b> "
+            f"{h(ai.combined_verdict)}\n"
+        )
 
     msg += (
         f"\n━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
@@ -932,48 +963,65 @@ def _format_full_report_html(
     ai: AIAnalysis,
     fund: Optional[FundamentalData],
 ) -> str:
-    """Combined technical + fundamental report."""
+    """Combined tech + fundamental report."""
     now_str = h(
         datetime.now(timezone.utc).strftime(
             "%Y-%m-%d %H:%M UTC"
         )
     )
 
+    # Direction
+    if ai.trade_idea.strip().lower() in ("buy", "long"):
+        trade_emoji = "🟢"
+        direction = "BUY"
+    elif ai.trade_idea.strip().lower() in (
+        "sell", "short",
+    ):
+        trade_emoji = "🔴"
+        direction = "SELL"
+    else:
+        trade_emoji = "🟡"
+        direction = "WAIT"
+
     msg = (
         f"{symbol.emoji} <b>{h(symbol.display_name)} "
-        f"— FULL REPORT ({h(tf.display_name)})</b>\n"
+        f"— FULL REPORT "
+        f"({h(tf.display_name)})</b>\n"
         "━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
     )
 
-    # ─── Technical Summary ────────────────────────
+    # Technical Summary
     msg += (
         "📊 <b>TECHNICAL SUMMARY</b>\n"
         f"Price: <code>"
         f"${ind.current_price:,.{symbol.decimal_places}f}"
         f"</code> ({ind.price_change_pct:+.3f}%)\n"
-        f"Trend: {h(ind.trend_direction)} | "
-        f"ADX: {ind.adx:.1f}\n"
-        f"RSI: {ind.rsi} | "
-        f"MACD: {h('Bullish' if ind.macd_histogram > 0 else 'Bearish')}\n"
-        f"Volatility: {h(ind.volatility_condition)}\n"
+        f"Trend: {h(ind.trend_direction)} "
+        f"| ADX: {ind.adx:.1f}\n"
+        f"RSI: {ind.rsi} | MACD: "
+        f"{h('Bullish' if ind.macd_histogram > 0 else 'Bearish')}\n"
+        f"Volatility: "
+        f"{h(ind.volatility_condition)}\n"
         f"Signal: <b>{h(ind.overall_bias)} "
         f"({ind.confidence_score}%)</b>\n\n"
     )
 
-    # ─── Key Levels ───────────────────────────────
+    # Key Levels
     msg += (
         "🛡 <b>KEY LEVELS</b>\n"
-        f"Resistance: <code>{ind.resistance_1}</code> "
-        f"→ <code>{ind.resistance_2}</code>\n"
-        f"Support: <code>{ind.support_1}</code> "
-        f"→ <code>{ind.support_2}</code>\n"
+        f"Resistance: "
+        f"<code>{ind.resistance_1}</code> → "
+        f"<code>{ind.resistance_2}</code>\n"
+        f"Support: "
+        f"<code>{ind.support_1}</code> → "
+        f"<code>{ind.support_2}</code>\n"
         f"Pivot: <code>{ind.pivot_point}</code> "
         f"| VPOC: <code>{ind.vpoc}</code>\n"
         f"Fib: 38.2% <code>{ind.fib_382}</code> "
         f"| 61.8% <code>{ind.fib_618}</code>\n\n"
     )
 
-    # ─── Fundamental Summary ──────────────────────
+    # Fundamental Summary
     if fund:
         msg += "🏦 <b>FUNDAMENTAL SUMMARY</b>\n"
         if symbol.asset_type == "crypto":
@@ -981,28 +1029,45 @@ def _format_full_report_html(
                 f"Fear &amp; Greed: "
                 f"{h(fund.fear_greed_index)} "
                 f"({h(fund.fear_greed_label)})\n"
-                f"MCap: {h(fund.btc_market_cap)} "
-                f"| Hash: {h(fund.btc_hashrate)}\n"
+                f"MCap: "
+                f"{h(fund.btc_market_cap)} | "
+                f"Hash: {h(fund.btc_hashrate)}\n"
             )
         else:
             msg += (
-                f"DXY: {h(fund.dxy_index)} "
-                f"| Fed: {h(fund.fed_rate)}\n"
+                f"DXY: {h(fund.dxy_index)} | "
+                f"Fed: {h(fund.fed_rate)}\n"
             )
+
+        if fund.key_drivers:
+            msg += "  ✅ " + "; ".join(
+                [h(d) for d in fund.key_drivers[:2]]
+            ) + "\n"
+        if fund.risk_factors:
+            msg += "  ⚠️ " + "; ".join(
+                [h(r) for r in fund.risk_factors[:2]]
+            ) + "\n"
+
         msg += (
             f"Fundamental Bias: "
             f"<b>{h(fund.fundamental_bias)}</b>\n\n"
         )
 
-    # ─── AI Verdict ───────────────────────────────
+    # AI Trade Plan — validated levels
     msg += (
-        "🤖 <b>AI TRADE PLAN</b>\n"
-        f"Bias: <b>{h(ai.bias)}</b>\n"
-        f"Trade: <b>{h(ai.trade_idea)}</b>\n"
-        f"Entry: <code>{h(ai.entry)}</code>\n"
-        f"SL: <code>{h(ai.stop_loss)}</code>\n"
-        f"TP1: <code>{h(ai.take_profit_1)}</code>\n"
-        f"TP2: <code>{h(ai.take_profit_2)}</code>\n\n"
+        f"{trade_emoji} <b>AI TRADE PLAN — "
+        f"{direction}</b>\n"
+        "┌─────────────────────────────┐\n"
+        f"│ Bias:  <b>{h(ai.bias)}</b>\n"
+        f"│ Trade: <b>{h(ai.trade_idea)}</b>\n"
+        f"│ Entry: <code>{h(ai.entry)}</code>\n"
+        f"│ SL:    <code>"
+        f"{h(ai.stop_loss)}</code>\n"
+        f"│ TP1:   <code>"
+        f"{h(ai.take_profit_1)}</code>\n"
+        f"│ TP2:   <code>"
+        f"{h(ai.take_profit_2)}</code>\n"
+        "└─────────────────────────────┘\n\n"
         f"⚠️ <b>Risk:</b> {h(ai.risk_note)}\n"
         f"🔮 <b>Outlook:</b> "
         f"{h(ai.short_term_outlook)}\n"
@@ -1016,7 +1081,8 @@ def _format_full_report_html(
 
     msg += (
         f"\n━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
-        f"<i>{now_str} • Not financial advice.</i>"
+        f"<i>{now_str} • 4 credits charged • "
+        f"Not financial advice.</i>"
     )
     return msg
 
@@ -1076,29 +1142,39 @@ async def cmd_credits(
 
     if user.id == OWNER_ID or role == "owner":
         msg = (
-            "👑 <b>Credits: Unlimited</b> ♾"
+            "👑 <b>Credit Status</b>\n"
+            "━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
+            "Role: <b>Owner</b>\n"
+            "Credits: <b>Unlimited</b> ♾\n\n"
+            "━━━━━━━━━━━━━━━━━━━━━━━━━━━"
         )
     else:
         remaining = max(0, limit - used)
-        emoji = "💎" if role == "premium" else "🆓"
-        role_name = (
-            "Premium" if role == "premium" else "Free"
-        )
+        if role == "premium":
+            emoji = "💎"
+            role_name = "Premium"
+        else:
+            emoji = "🆓"
+            role_name = "Free"
+
         msg = (
             f"{emoji} <b>Credit Status</b>\n"
             "━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
-            f"Role: <b>{role_name}</b>\n"
+            f"Role: <b>{h(role_name)}</b>\n"
             f"Used Today: "
             f"<code>{used}/{limit}</code>\n"
             f"Remaining: <b>{remaining}</b>\n\n"
+            "⏰ Resets at <code>00:00 UTC</code>\n\n"
             "<b>Command Costs:</b>\n"
             "  /price, /analysis, /chart, "
-            "/fundamental → 1 credit\n"
-            "  /fullreport → 4 credits\n\n"
-            "Resets at <code>00:00 UTC</code>"
+            "/fundamental → 1\n"
+            "  /fullreport → <b>4</b>\n"
         )
+
         if role == "free":
-            msg += "\n\n💡 /upgrade for more credits!"
+            msg += (
+                "\n💡 Need more? /upgrade for Premium!"
+            )
 
         msg += "\n━━━━━━━━━━━━━━━━━━━━━━━━━━━"
 
