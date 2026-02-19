@@ -4,8 +4,7 @@
 ║                    DATABASE LAYER (PostgreSQL)                      ║
 ║                                                                    ║
 ║  Async PostgreSQL connection pool using asyncpg.                   ║
-║  Handles: user CRUD, credit tracking, stats, daily resets.         ║
-║  FIXED: Clean async patterns, Python 3.13 compatible.              ║
+║  UPDATED: increment_usage supports variable amount.                ║
 ╚══════════════════════════════════════════════════════════════════════╝
 """
 
@@ -94,7 +93,8 @@ def get_pool() -> asyncpg.Pool:
     """Return the live pool or raise if not initialised."""
     if _pool is None:
         raise RuntimeError(
-            "Database pool is not initialised. Call init_pool() first."
+            "Database pool is not initialised. "
+            "Call init_pool() first."
         )
     return _pool
 
@@ -145,15 +145,16 @@ async def get_or_create_user(
                 user_id,
             )
             logger.info(
-                f"New free user created: {user_id} (@{username})"
+                f"New free user created: {user_id} "
+                f"(@{username})"
             )
             return dict(row)
 
 
 async def reset_daily_if_needed(user_id: int) -> dict:
     """
-    If the user's last_reset is before today (UTC), zero out
-    daily_used and stamp today.  Returns the (possibly updated) row.
+    If the user's last_reset is before today (UTC),
+    zero out daily_used and stamp today.
     """
     pool = get_pool()
     today = date.today()
@@ -161,7 +162,8 @@ async def reset_daily_if_needed(user_id: int) -> dict:
     async with pool.acquire() as conn:
         async with conn.transaction():
             row = await conn.fetchrow(
-                "SELECT * FROM users WHERE user_id = $1 FOR UPDATE",
+                "SELECT * FROM users "
+                "WHERE user_id = $1 FOR UPDATE",
                 user_id,
             )
 
@@ -179,9 +181,12 @@ async def reset_daily_if_needed(user_id: int) -> dict:
                     today,
                     user_id,
                 )
-                logger.info(f"Daily reset for user {user_id}")
+                logger.info(
+                    f"Daily reset for user {user_id}"
+                )
                 row = await conn.fetchrow(
-                    "SELECT * FROM users WHERE user_id = $1",
+                    "SELECT * FROM users "
+                    "WHERE user_id = $1",
                     user_id,
                 )
 
@@ -189,14 +194,14 @@ async def reset_daily_if_needed(user_id: int) -> dict:
 
 
 async def increment_usage(
-    user_id: int,
-    amount: int = 1,
+    user_id: int, amount: int = 1
 ) -> None:
-    """Atomically bump daily_used by the given amount."""
+    """Atomically bump daily_used by `amount`."""
     pool = get_pool()
     await pool.execute(
-        "UPDATE users SET daily_used = daily_used + \$1 "
-        "WHERE user_id = \$2",
+        "UPDATE users "
+        "SET daily_used = daily_used + $1 "
+        "WHERE user_id = $2",
         amount,
         user_id,
     )
@@ -235,20 +240,20 @@ async def set_role(
 # Stats helpers
 # ==========================================================================
 async def get_all_user_stats() -> dict:
-    """
-    Return aggregate numbers:
-      total_users, premium_users, free_users, today_commands
-    """
     pool = get_pool()
     today = date.today()
 
     async with pool.acquire() as conn:
-        total = await conn.fetchval("SELECT COUNT(*) FROM users")
+        total = await conn.fetchval(
+            "SELECT COUNT(*) FROM users"
+        )
         premium = await conn.fetchval(
-            "SELECT COUNT(*) FROM users WHERE role = 'premium'"
+            "SELECT COUNT(*) FROM users "
+            "WHERE role = 'premium'"
         )
         free = await conn.fetchval(
-            "SELECT COUNT(*) FROM users WHERE role = 'free'"
+            "SELECT COUNT(*) FROM users "
+            "WHERE role = 'free'"
         )
         today_cmds = await conn.fetchval(
             """
@@ -268,13 +273,13 @@ async def get_all_user_stats() -> dict:
 
 
 async def get_api_stats_today() -> dict:
-    """Return today's API call counters."""
     pool = get_pool()
     today = date.today()
 
     async with pool.acquire() as conn:
         row = await conn.fetchrow(
-            "SELECT * FROM api_stats WHERE stat_date = $1",
+            "SELECT * FROM api_stats "
+            "WHERE stat_date = $1",
             today,
         )
 
@@ -292,14 +297,15 @@ async def increment_api_counter(
     column: str,
     amount: int = 1,
 ) -> None:
-    """
-    Bump one of the api_stats counters for today.
-    column must be one of:
-        twelvedata_calls | gemini_calls | total_commands
-    """
-    allowed = {"twelvedata_calls", "gemini_calls", "total_commands"}
+    allowed = {
+        "twelvedata_calls",
+        "gemini_calls",
+        "total_commands",
+    }
     if column not in allowed:
-        raise ValueError(f"Invalid counter column: {column}")
+        raise ValueError(
+            f"Invalid counter column: {column}"
+        )
 
     pool = get_pool()
     today = date.today()
