@@ -188,12 +188,16 @@ async def reset_daily_if_needed(user_id: int) -> dict:
             return dict(row)
 
 
-async def increment_usage(user_id: int) -> None:
-    """Atomically bump daily_used by 1."""
+async def increment_usage(
+    user_id: int,
+    amount: int = 1,
+) -> None:
+    """Atomically bump daily_used by the given amount."""
     pool = get_pool()
     await pool.execute(
-        "UPDATE users SET daily_used = daily_used + 1 "
-        "WHERE user_id = $1",
+        "UPDATE users SET daily_used = daily_used + \$1 "
+        "WHERE user_id = \$2",
+        amount,
         user_id,
     )
 
