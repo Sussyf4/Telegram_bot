@@ -287,20 +287,26 @@ async def cmd_help(
         "🔹 <b>Bot Commands</b>\n"
         "━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
         "<b>📊 Analysis:</b>\n"
-        "/price — Live price (1 credit)\n"
-        "/analysis — Full AI analysis (1 credit)\n"
-        "/chart — Technical chart (1 credit)\n"
-        "/fundamental — Fundamental data (1 credit)\n"
-        "/fullreport — Combined report (1 credit)\n\n"
+        "/price — Live price "
+        "<i>(1 credit)</i>\n"
+        "/analysis — Full AI analysis "
+        "<i>(1 credit)</i>\n"
+        "/chart — Technical chart "
+        "<i>(1 credit)</i>\n"
+        "/fundamental — Fundamental data "
+        "<i>(1 credit)</i>\n"
+        "/fullreport — Combined tech+fundamental "
+        "<i>(⭐ 4 credits)</i>\n\n"
         "<b>⚙️ Settings:</b>\n"
-        "/timeframe &lt;tf&gt; — Change timeframe\n\n"
+        "/timeframe &lt;tf&gt; — Change timeframe "
+        "<i>(free)</i>\n\n"
         "<b>👤 Account:</b>\n"
-        "/credits — Daily credits\n"
-        "/checkid — Account info\n"
-        "/upgrade — Premium upgrade\n\n"
+        "/credits — Daily credits <i>(free)</i>\n"
+        "/checkid — Account info <i>(free)</i>\n"
+        "/upgrade — Premium upgrade <i>(free)</i>\n\n"
         f"<b>Symbols:</b>\n{symbols_text}\n\n"
         "<b>Timeframes:</b> "
-        "<code>5m 15m 1h 4h 1d</code>\n"
+        "<code>5m 15m 1h 4h 1d</code>\n\n"
         "━━━━━━━━━━━━━━━━━━━━━━━━━━━"
     )
     await update.message.reply_text(
@@ -369,15 +375,16 @@ async def cmd_fundamental(
 
 
 # ──────────────────────────────────────────────────
-# /fullreport — combined tech + fundamental
+# /fullreport — costs 4 credits
 # ──────────────────────────────────────────────────
-@require_credit
+@require_credit(cost=4)
 async def cmd_fullreport(
     update: Update, context: ContextTypes.DEFAULT_TYPE
 ) -> None:
     keyboard = build_symbol_keyboard("fullreport")
     await update.message.reply_text(
-        "📊 <b>Select symbol for full report:</b>",
+        "📊 <b>Select symbol for full report</b>\n"
+        "💡 <i>This command costs 4 credits.</i>",
         parse_mode=ParseMode.HTML,
         reply_markup=keyboard,
     )
