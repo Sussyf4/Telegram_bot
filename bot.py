@@ -1081,14 +1081,26 @@ async def cmd_credits(
     else:
         remaining = max(0, limit - used)
         emoji = "💎" if role == "premium" else "🆓"
+        role_name = (
+            "Premium" if role == "premium" else "Free"
+        )
         msg = (
-            f"{emoji} <b>Credits</b>\n"
-            f"Used: <code>{used}/{limit}</code>\n"
-            f"Remaining: <b>{remaining}</b>\n"
+            f"{emoji} <b>Credit Status</b>\n"
+            "━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
+            f"Role: <b>{role_name}</b>\n"
+            f"Used Today: "
+            f"<code>{used}/{limit}</code>\n"
+            f"Remaining: <b>{remaining}</b>\n\n"
+            "<b>Command Costs:</b>\n"
+            "  /price, /analysis, /chart, "
+            "/fundamental → 1 credit\n"
+            "  /fullreport → 4 credits\n\n"
             "Resets at <code>00:00 UTC</code>"
         )
         if role == "free":
-            msg += "\n\n💡 /upgrade for more!"
+            msg += "\n\n💡 /upgrade for more credits!"
+
+        msg += "\n━━━━━━━━━━━━━━━━━━━━━━━━━━━"
 
     await update.message.reply_text(
         msg, parse_mode=ParseMode.HTML
