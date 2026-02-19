@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
 """
 ╔══════════════════════════════════════════════════════════════════════╗
-║                    ENHANCED AI ANALYZER v4.1                       ║
+║                    ENHANCED AI ANALYZER v2                         ║
 ║                                                                    ║
-║  FIXED: Fallback logic respects bias direction for SL/TP.          ║
-║  FIXED: Parser handles action_levels embedded in entry.            ║
+║  FIXED: Fallback correctly assigns SL/TP based on bias.           ║
+║  FIXED: Parse separates AI fields from indicator action_levels.    ║
 ║  Purely synchronous — runs inside run_in_executor().               ║
 ╚══════════════════════════════════════════════════════════════════════╝
 """
@@ -26,7 +26,7 @@ from fundamental_engine import FundamentalData
 
 logger = logging.getLogger("XAUUSD_Bot.ai")
 
-GEMINI_MODEL = "gemini-2.5-flash"
+GEMINI_MODEL = "gemini-2.0-flash"
 
 
 @dataclass
@@ -53,7 +53,7 @@ class EnhancedAIAnalyzer:
         self._max_retries = 3
         self._retry_delay = 2.0
         logger.info(
-            f"Enhanced AI Analyzer initialized | "
+            f"Enhanced AI Analyzer v2 | "
             f"model: {self.model_name}"
         )
 
@@ -75,14 +75,15 @@ class EnhancedAIAnalyzer:
             return analysis
 
         prompt = self._build_combined_prompt(
-            df, indicators, symbol, timeframe, fundamental
+            df, indicators, symbol,
+            timeframe, fundamental,
         )
 
         last_error = None
         for attempt in range(1, self._max_retries + 1):
             try:
                 logger.info(
-                    f"AI request attempt "
+                    f"AI attempt "
                     f"{attempt}/{self._max_retries} "
                     f"for {symbol.display_name}..."
                 )
@@ -116,19 +117,31 @@ class EnhancedAIAnalyzer:
                     raw_text, analysis
                 )
 
-                # Validate critical fields
                 if analysis.bias not in (
                     "N/A", "Error", ""
                 ):
-                    # Extra validation: ensure SL/TP
-                    # make sense for the bias direction
+                    # Validate that SL/TP make sense
                     analysis = self._validate_levels(
                         analysis, indicators
                     )
                     logger.info(
-                        f"AI parsed OK: "
-                        f"bias={analysis.bias}, "
-                        f"trade={analysis.trade_idea}"
+                        f"AI parsed: bias={analysis.bias}, "
+                        f"entry={analysis.entry}, "
+                        f"sl={analysis.stop_loss}, "
+                        f"tp1={analysis.take_profit_1}, "
+                        f"tp2={analysis.take_profit_2}"
+                    )
+                    return analysis
+
+                # Try fallback regex parse
+                analysis = self._fallback_parse(
+                    raw_text, analysis
+                )
+                if analysis.bias not in (
+                    "N/A", "Error", ""
+                ):
+                    analysis = self._validate_levels(
+                        analysis, indicators
                     )
                     return analysis
 
@@ -140,7 +153,8 @@ class EnhancedAIAnalyzer:
             except Exception as exc:
                 last_error = str(exc)
                 logger.error(
-                    f"AI attempt {attempt} failed: {exc}"
+                    f"AI attempt {attempt} failed: "
+                    f"{exc}"
                 )
                 logger.debug(traceback.format_exc())
                 if attempt < self._max_retries:
@@ -155,9 +169,9 @@ class EnhancedAIAnalyzer:
             indicators, symbol, fundamental
         )
 
-    # ──────────────────────────────────────────────────
+    # ──────────────────────────────────────────────
     # Prompt Builder
-    # ──────────────────────────────────────────────────
+    # ──────────────────────────────────────────────
     def _build_combined_prompt(
         self,
         df: pd.DataFrame,
@@ -181,10 +195,11 @@ class EnhancedAIAnalyzer:
         )
 
         prompt = (
-            f"You are a senior {symbol.display_name} "
-            f"analyst. Analyze this combined data.\n\n"
+            f"You are a senior "
+            f"{symbol.display_name} analyst.\n\n"
             f"=== MARKET DATA — "
-            f"{symbol.display_name} ({timeframe}) ===\n"
+            f"{symbol.display_name} ({timeframe}) "
+            f"===\n"
             f"Current: {latest['close']:.2f}\n"
             f"Open: {latest['open']:.2f}\n"
             f"High: {latest['high']:.2f}\n"
@@ -192,114 +207,105 @@ class EnhancedAIAnalyzer:
             f"Change: {price_change:+.2f} "
             f"({price_change_pct:+.3f}%)\n"
             f"Last 5 closes: {last_5}\n\n"
-            f"=== TECHNICAL INDICATORS ===\n"
+            f"=== TECHNICAL ===\n"
             f"Trend: {ind.trend_direction} "
             f"(ADX {ind.adx:.1f})\n"
-            f"EMA9: {ind.ema_9}, EMA20: {ind.ema_20}, "
+            f"EMA9: {ind.ema_9}, "
+            f"EMA20: {ind.ema_20}, "
             f"EMA50: {ind.ema_50}\n"
-            f"RSI(14): {ind.rsi} "
-            f"| Stoch: {ind.stoch_k:.0f}K/"
+            f"RSI(14): {ind.rsi} | "
+            f"Stoch: {ind.stoch_k:.0f}K/"
             f"{ind.stoch_d:.0f}D\n"
             f"MACD Hist: {ind.macd_histogram:.4f}\n"
-            f"ATR: {ind.atr} ({ind.atr_percent:.2f}%)\n"
-            f"Support S1: {ind.support_1}, "
-            f"S2: {ind.support_2}\n"
-            f"Resistance R1: {ind.resistance_1}, "
-            f"R2: {ind.resistance_2}\n"
+            f"ATR: {ind.atr} "
+            f"({ind.atr_percent:.2f}%)\n"
+            f"Support 1: {ind.support_1} | "
+            f"Support 2: {ind.support_2}\n"
+            f"Resistance 1: {ind.resistance_1} | "
+            f"Resistance 2: {ind.resistance_2}\n"
             f"Pivot: {ind.pivot_point}\n"
-            f"Fib 38.2%: {ind.fib_382}, "
+            f"Fib 38.2%: {ind.fib_382} | "
             f"Fib 61.8%: {ind.fib_618}\n"
-            f"VPOC: {ind.vpoc}\n"
+            f"VPOC: {ind.vpoc} | "
             f"VWAP: {ind.vwap}\n"
             f"Volume ratio: {ind.volume_ratio:.1f}x\n"
-            f"Overall Signal: {ind.overall_bias} "
-            f"({ind.confidence_score}% confidence)\n\n"
+            f"Overall: {ind.overall_bias} "
+            f"({ind.confidence_score}%)\n\n"
         )
 
         if fund:
-            prompt += "=== FUNDAMENTAL DATA ===\n"
+            prompt += "=== FUNDAMENTAL ===\n"
             if symbol.asset_type == "crypto":
                 prompt += (
-                    f"Fear & Greed: "
+                    f"Fear&Greed: "
                     f"{fund.fear_greed_index} "
                     f"({fund.fear_greed_label})\n"
-                    f"Market Cap: "
-                    f"{fund.btc_market_cap}\n"
-                    f"24h Volume: "
+                    f"MCap: {fund.btc_market_cap}\n"
+                    f"24h Vol: "
                     f"{fund.btc_24h_volume}\n"
                     f"Hashrate: "
                     f"{fund.btc_hashrate}\n"
-                    f"BTC Dominance: "
-                    f"{fund.btc_dominance}\n"
                 )
             else:
                 prompt += (
                     f"DXY: {fund.dxy_index}\n"
                     f"Fed Rate: {fund.fed_rate}\n"
-                    f"CPI YoY: {fund.us_cpi_yoy}\n"
-                    f"ETF Flows: "
-                    f"{fund.gold_etf_flows}\n"
-                    f"Central Banks: "
-                    f"{fund.central_bank_buying}\n"
+                    f"CPI: {fund.us_cpi_yoy}\n"
                 )
-
             if fund.key_drivers:
                 prompt += (
-                    f"Key Drivers: "
+                    f"Drivers: "
                     f"{'; '.join(fund.key_drivers)}\n"
                 )
             if fund.risk_factors:
                 prompt += (
-                    f"Risk Factors: "
+                    f"Risks: "
                     f"{'; '.join(fund.risk_factors)}\n"
                 )
             prompt += (
-                f"Fundamental Bias: "
+                f"Fund. Bias: "
                 f"{fund.fundamental_bias}\n\n"
             )
 
         prompt += (
             "RESPOND IN EXACTLY THIS FORMAT "
-            "(each field on its own line, "
-            "use ONLY specific price numbers):\n\n"
+            "(one field per line, "
+            "specific numeric prices only):\n\n"
             "BIAS: Bullish or Bearish or Neutral\n"
             "TRADE: Buy or Sell or Wait\n"
-            "ENTRY: <lower_price>-<upper_price>\n"
-            "STOP_LOSS: <single_price>\n"
-            "TP1: <single_price>\n"
-            "TP2: <single_price>\n"
-            "RISK: One sentence.\n"
-            "OUTLOOK: One-two sentences.\n"
-            "FUNDAMENTAL: One sentence on macro impact.\n"
-            "VERDICT: One sentence combining "
-            "technical+fundamental.\n\n"
+            "ENTRY: <single price or price-price range>\n"
+            "STOP_LOSS: <single price>\n"
+            "TP1: <single price>\n"
+            "TP2: <single price>\n"
+            "RISK: <one sentence>\n"
+            "OUTLOOK: <one-two sentences>\n"
+            "FUNDAMENTAL: <one sentence on macro>\n"
+            "VERDICT: <one sentence combining "
+            "tech + fundamental>\n\n"
             "CRITICAL RULES:\n"
             "- For ENTRY, STOP_LOSS, TP1, TP2: "
-            "use ONLY numbers (e.g. 2350.00)\n"
-            "- Do NOT put text like 'Sell zone:' "
-            "in the ENTRY field\n"
-            "- Do NOT repeat SL or TP values "
-            "in the ENTRY field\n"
-            "- ENTRY must be just a price range: "
-            "e.g. 2350.00-2355.00\n"
-            "- STOP_LOSS must be a single number "
-            "above entry for Sell, below entry for Buy\n"
-            "- TP1 must be BELOW entry for Sell, "
-            "ABOVE entry for Buy\n"
-            "- TP2 must be further than TP1 "
-            "in the trade direction\n"
-            "- For Sell: SL > Entry > TP1 > TP2\n"
-            "- For Buy: SL < Entry < TP1 < TP2\n"
-            "- Account for ATR in stop loss distance\n"
+            "use ONLY numeric prices like 2350.00 "
+            "or 2350.00-2360.00\n"
+            "- Do NOT put descriptions or text "
+            "in price fields\n"
+            "- For BUY trades: SL must be BELOW entry, "
+            "TP1 and TP2 must be ABOVE entry\n"
+            "- For SELL trades: SL must be ABOVE entry, "
+            "TP1 and TP2 must be BELOW entry\n"
+            "- TP1 is conservative (closer), "
+            "TP2 is aggressive (further)\n"
+            "- Stop loss should account for "
+            "ATR volatility\n"
             "- If unclear, recommend Wait\n"
-            "- NO markdown formatting\n"
-            "- Each field on its own line\n"
+            "- NO markdown, NO asterisks\n"
+            "- Each field MUST start at beginning "
+            "of a new line\n"
         )
         return prompt
 
-    # ──────────────────────────────────────────────────
-    # Response Parser
-    # ──────────────────────────────────────────────────
+    # ──────────────────────────────────────────────
+    # Primary Parser
+    # ──────────────────────────────────────────────
     def _parse_response(
         self, text: str, analysis: AIAnalysis
     ) -> AIAnalysis:
@@ -356,177 +362,222 @@ class EnhancedAIAnalyzer:
             key = parts[0].strip().upper()
             value = parts[1].strip()
 
-            if value and key in field_map:
-                setattr(
-                    analysis, field_map[key], value
-                )
+            if not value:
+                continue
 
-        # ── Post-parse cleanup ────────────────────────
-        # Clean entry field: strip text prefixes
-        analysis.entry = self._clean_entry(
-            analysis.entry
-        )
+            if key in field_map:
+                attr_name = field_map[key]
 
-        # Clean SL/TP: extract just the number
-        analysis.stop_loss = self._extract_price(
-            analysis.stop_loss
-        )
-        analysis.take_profit_1 = self._extract_price(
-            analysis.take_profit_1
-        )
-        analysis.take_profit_2 = self._extract_price(
-            analysis.take_profit_2
-        )
+                # Clean price fields — strip text,
+                # keep only numbers and dashes
+                if attr_name in (
+                    "entry", "stop_loss",
+                    "take_profit_1", "take_profit_2",
+                ):
+                    value = self._extract_price(value)
+
+                setattr(analysis, attr_name, value)
 
         return analysis
 
-    def _clean_entry(self, entry: str) -> str:
-        """
-        Clean entry field.
-        Remove text like 'Sell zone:', 'Buy zone:',
-        'SL:', 'TP1:', etc. Keep only the price range.
-        """
-        if entry in ("N/A", ""):
-            return entry
+    # ──────────────────────────────────────────────
+    # Fallback Regex Parser
+    # ──────────────────────────────────────────────
+    def _fallback_parse(
+        self, text: str, analysis: AIAnalysis
+    ) -> AIAnalysis:
+        if not text:
+            return analysis
 
-        # If entry contains embedded SL/TP info,
-        # extract just the price range
-        # Pattern: "Sell zone: 1234-5678, SL: ..., TP1: ..."
-        # We want just "1234-5678"
-
-        # Try to find a price range pattern first
-        range_match = re.search(
-            r'(\d+\.?\d*)\s*[-–]\s*(\d+\.?\d*)',
-            entry,
+        text_clean = (
+            text.replace("**", "")
+            .replace("*", "")
+            .replace("`", "")
         )
-        if range_match:
-            return (
-                f"{range_match.group(1)}-"
-                f"{range_match.group(2)}"
+
+        patterns = {
+            "bias": (
+                r"(?:BIAS|MARKET\s*BIAS)"
+                r"\s*[:=]\s*(.+?)(?:\n|$)"
+            ),
+            "trade_idea": (
+                r"(?:TRADE|TRADE\s*IDEA|ACTION|SIGNAL)"
+                r"\s*[:=]\s*(.+?)(?:\n|$)"
+            ),
+            "entry": (
+                r"(?:ENTRY|ENTRY\s*(?:ZONE|PRICE)?)"
+                r"\s*[:=]\s*(.+?)(?:\n|$)"
+            ),
+            "stop_loss": (
+                r"(?:STOP[\s_]*LOSS|SL)"
+                r"\s*[:=]\s*(.+?)(?:\n|$)"
+            ),
+            "take_profit_1": (
+                r"(?:TP1|TAKE[\s_]*PROFIT[\s_]*1"
+                r"|TARGET[\s_]*1)"
+                r"\s*[:=]\s*(.+?)(?:\n|$)"
+            ),
+            "take_profit_2": (
+                r"(?:TP2|TAKE[\s_]*PROFIT[\s_]*2"
+                r"|TARGET[\s_]*2)"
+                r"\s*[:=]\s*(.+?)(?:\n|$)"
+            ),
+            "risk_note": (
+                r"(?:RISK|RISK[\s_]*"
+                r"(?:NOTE|ASSESSMENT)?)"
+                r"\s*[:=]\s*(.+?)(?:\n|$)"
+            ),
+            "short_term_outlook": (
+                r"(?:OUTLOOK|SHORT[\s\-_]*"
+                r"TERM[\s_]*OUTLOOK)"
+                r"\s*[:=]\s*(.+?)(?:\n|$)"
+            ),
+            "fundamental_note": (
+                r"(?:FUNDAMENTAL"
+                r"(?:\s*NOTE)?)"
+                r"\s*[:=]\s*(.+?)(?:\n|$)"
+            ),
+            "combined_verdict": (
+                r"(?:VERDICT|COMBINED\s*VERDICT)"
+                r"\s*[:=]\s*(.+?)(?:\n|$)"
+            ),
+        }
+
+        price_fields = {
+            "entry", "stop_loss",
+            "take_profit_1", "take_profit_2",
+        }
+
+        for field_name, pattern in patterns.items():
+            match = re.search(
+                pattern, text_clean, re.IGNORECASE
             )
+            if match:
+                value = match.group(1).strip()
+                if value and value != "N/A":
+                    if field_name in price_fields:
+                        value = self._extract_price(value)
+                    setattr(analysis, field_name, value)
 
-        # Try single price
-        single_match = re.search(
-            r'(\d+\.?\d+)', entry
+        return analysis
+
+    # ──────────────────────────────────────────────
+    # Extract clean price from messy AI output
+    # ──────────────────────────────────────────────
+    @staticmethod
+    def _extract_price(text: str) -> str:
+        """
+        Extract numeric price(s) from AI response.
+        Handles: "\$2,350.00", "around 2350-2360",
+        "2350.00 (conservative)", etc.
+        Returns clean format: "2350.00" or "2350.00-2360.00"
+        """
+        if not text:
+            return "N/A"
+
+        # Remove $, commas, and common words
+        cleaned = text.replace("$", "").replace(",", "")
+
+        # Find all decimal numbers
+        numbers = re.findall(
+            r'\d+\.?\d*', cleaned
         )
-        if single_match:
-            return single_match.group(1)
 
-        return entry
+        if not numbers:
+            return text.strip()
 
-    def _extract_price(self, value: str) -> str:
-        """
-        Extract a clean price number from a field.
-        Handles cases like 'around 2350.00',
-        '\$2350.00', etc.
-        """
-        if value in ("N/A", ""):
-            return value
+        if len(numbers) == 1:
+            return numbers[0]
+        elif len(numbers) == 2:
+            return f"{numbers[0]}-{numbers[1]}"
+        else:
+            # Take first two meaningful numbers
+            return f"{numbers[0]}-{numbers[1]}"
 
-        # Find first decimal number pattern
-        match = re.search(r'(\d+\.?\d*)', value)
-        if match:
-            return match.group(1)
-
-        return value
-
-    # ──────────────────────────────────────────────────
-    # Validate SL/TP Direction
-    # ──────────────────────────────────────────────────
+    # ──────────────────────────────────────────────
+    # Validate that SL/TP are directionally correct
+    # ──────────────────────────────────────────────
     def _validate_levels(
         self,
         analysis: AIAnalysis,
         ind: AdvancedTechnicalIndicators,
     ) -> AIAnalysis:
         """
-        Validate that SL/TP make directional sense.
-        For Sell: SL > entry > TP1 > TP2
-        For Buy:  SL < entry < TP1 < TP2
-        If wrong, recalculate from indicators + ATR.
+        Ensure SL/TP make directional sense.
+        For BUY: SL < entry < TP1 < TP2
+        For SELL: SL > entry > TP1 > TP2
+        If invalid, recalculate from indicators.
         """
         try:
             # Parse entry midpoint
-            entry_mid = self._get_entry_midpoint(
+            entry_mid = self._parse_mid_price(
                 analysis.entry
             )
-            sl = self._parse_float(analysis.stop_loss)
-            tp1 = self._parse_float(
+            sl = self._parse_single_price(
+                analysis.stop_loss
+            )
+            tp1 = self._parse_single_price(
                 analysis.take_profit_1
             )
-            tp2 = self._parse_float(
+            tp2 = self._parse_single_price(
                 analysis.take_profit_2
             )
 
             if entry_mid is None:
-                entry_mid = ind.current_price
+                return analysis
 
-            is_sell = (
-                "sell" in analysis.trade_idea.lower()
-                or "bearish" in analysis.bias.lower()
+            is_buy = analysis.trade_idea.strip().lower() in (
+                "buy", "long",
             )
-            is_buy = (
-                "buy" in analysis.trade_idea.lower()
-                or "bullish" in analysis.bias.lower()
+            is_sell = analysis.trade_idea.strip().lower() in (
+                "sell", "short",
             )
+
+            if not (is_buy or is_sell):
+                return analysis
 
             needs_fix = False
 
-            if is_sell:
-                # SL should be ABOVE entry
-                # TP1, TP2 should be BELOW entry
-                # TP2 < TP1 < entry < SL
-                if sl is not None and sl < entry_mid:
+            if is_buy:
+                # SL should be below entry
+                if sl is not None and sl >= entry_mid:
                     needs_fix = True
-                    logger.warning(
-                        f"SELL but SL({sl}) < "
-                        f"Entry({entry_mid})"
-                    )
-                if tp1 is not None and tp1 > entry_mid:
+                # TP1 should be above entry
+                if tp1 is not None and tp1 <= entry_mid:
                     needs_fix = True
-                    logger.warning(
-                        f"SELL but TP1({tp1}) > "
-                        f"Entry({entry_mid})"
-                    )
-                if tp2 is not None and tp1 is not None:
-                    if tp2 > tp1:
-                        needs_fix = True
-                        logger.warning(
-                            f"SELL but TP2({tp2}) > "
-                            f"TP1({tp1})"
-                        )
+                # TP2 should be above TP1
+                if (
+                    tp1 is not None
+                    and tp2 is not None
+                    and tp2 <= tp1
+                ):
+                    needs_fix = True
 
-            elif is_buy:
-                # SL should be BELOW entry
-                # TP1, TP2 should be ABOVE entry
-                # SL < entry < TP1 < TP2
-                if sl is not None and sl > entry_mid:
+            elif is_sell:
+                # SL should be above entry
+                if sl is not None and sl <= entry_mid:
                     needs_fix = True
-                    logger.warning(
-                        f"BUY but SL({sl}) > "
-                        f"Entry({entry_mid})"
-                    )
-                if tp1 is not None and tp1 < entry_mid:
+                # TP1 should be below entry
+                if tp1 is not None and tp1 >= entry_mid:
                     needs_fix = True
-                    logger.warning(
-                        f"BUY but TP1({tp1}) < "
-                        f"Entry({entry_mid})"
-                    )
-                if tp2 is not None and tp1 is not None:
-                    if tp2 < tp1:
-                        needs_fix = True
-                        logger.warning(
-                            f"BUY but TP2({tp2}) < "
-                            f"TP1({tp1})"
-                        )
+                # TP2 should be below TP1
+                if (
+                    tp1 is not None
+                    and tp2 is not None
+                    and tp2 >= tp1
+                ):
+                    needs_fix = True
 
             if needs_fix:
-                logger.info(
-                    "Recalculating SL/TP from "
-                    "indicators..."
+                logger.warning(
+                    f"AI levels invalid for "
+                    f"{analysis.trade_idea}. "
+                    f"Entry~{entry_mid}, SL={sl}, "
+                    f"TP1={tp1}, TP2={tp2}. "
+                    f"Recalculating..."
                 )
                 analysis = self._fix_levels_from_indicators(
-                    analysis, ind, entry_mid,
-                    is_sell, is_buy,
+                    analysis, ind, entry_mid
                 )
 
         except Exception as exc:
@@ -541,116 +592,168 @@ class EnhancedAIAnalyzer:
         analysis: AIAnalysis,
         ind: AdvancedTechnicalIndicators,
         entry_mid: float,
-        is_sell: bool,
-        is_buy: bool,
     ) -> AIAnalysis:
-        """Recalculate SL/TP using ATR and S/R levels."""
+        """
+        Recalculate SL/TP using indicator levels,
+        respecting trade direction.
+        """
         atr = ind.atr if ind.atr > 0 else 1.0
 
-        if is_sell:
-            # SELL: SL above, TPs below
-            sl = entry_mid + atr * 1.5
-            tp1 = entry_mid - atr * 1.5
-            tp2 = entry_mid - atr * 2.5
+        is_buy = analysis.trade_idea.strip().lower() in (
+            "buy", "long",
+        )
 
-            # Prefer indicator levels if they
-            # make directional sense
-            if ind.resistance_1 > entry_mid:
-                sl = ind.resistance_1 + atr * 0.3
-            if ind.support_1 < entry_mid:
-                tp1 = ind.support_1
-            if ind.support_2 < tp1:
-                tp2 = ind.support_2
-
-            analysis.stop_loss = f"{sl:.2f}"
-            analysis.take_profit_1 = f"{tp1:.2f}"
-            analysis.take_profit_2 = f"{tp2:.2f}"
-
-            logger.info(
-                f"SELL fixed: SL={sl:.2f}, "
-                f"TP1={tp1:.2f}, TP2={tp2:.2f}"
+        if is_buy:
+            # SL below entry — use support or ATR
+            sl_candidates = [
+                ind.support_1,
+                ind.support_2,
+                entry_mid - atr * 1.5,
+            ]
+            sl = max(
+                [s for s in sl_candidates
+                 if s < entry_mid],
+                default=entry_mid - atr * 1.5,
             )
 
-        elif is_buy:
-            # BUY: SL below, TPs above
-            sl = entry_mid - atr * 1.5
-            tp1 = entry_mid + atr * 1.5
-            tp2 = entry_mid + atr * 2.5
-
-            # Prefer indicator levels
-            if ind.support_1 < entry_mid:
-                sl = ind.support_1 - atr * 0.3
-            if ind.resistance_1 > entry_mid:
-                tp1 = ind.resistance_1
-            if ind.resistance_2 > tp1:
-                tp2 = ind.resistance_2
-
-            analysis.stop_loss = f"{sl:.2f}"
-            analysis.take_profit_1 = f"{tp1:.2f}"
-            analysis.take_profit_2 = f"{tp2:.2f}"
-
-            logger.info(
-                f"BUY fixed: SL={sl:.2f}, "
-                f"TP1={tp1:.2f}, TP2={tp2:.2f}"
+            # TP above entry — use resistance
+            tp1_candidates = [
+                ind.resistance_1,
+                ind.fib_618,
+                entry_mid + atr * 1.5,
+            ]
+            tp1 = min(
+                [t for t in tp1_candidates
+                 if t > entry_mid],
+                default=entry_mid + atr * 1.5,
             )
+
+            tp2_candidates = [
+                ind.resistance_2,
+                ind.resistance_3,
+                entry_mid + atr * 2.5,
+            ]
+            tp2 = min(
+                [t for t in tp2_candidates
+                 if t > tp1],
+                default=tp1 + atr,
+            )
+
+        else:  # SELL
+            # SL above entry — use resistance or ATR
+            sl_candidates = [
+                ind.resistance_1,
+                ind.resistance_2,
+                entry_mid + atr * 1.5,
+            ]
+            sl = min(
+                [s for s in sl_candidates
+                 if s > entry_mid],
+                default=entry_mid + atr * 1.5,
+            )
+
+            # TP below entry — use support
+            tp1_candidates = [
+                ind.support_1,
+                ind.fib_382,
+                entry_mid - atr * 1.5,
+            ]
+            tp1 = max(
+                [t for t in tp1_candidates
+                 if t < entry_mid],
+                default=entry_mid - atr * 1.5,
+            )
+
+            tp2_candidates = [
+                ind.support_2,
+                ind.support_3,
+                entry_mid - atr * 2.5,
+            ]
+            tp2 = max(
+                [t for t in tp2_candidates
+                 if t < tp1],
+                default=tp1 - atr,
+            )
+
+        analysis.stop_loss = f"{sl:.2f}"
+        analysis.take_profit_1 = f"{tp1:.2f}"
+        analysis.take_profit_2 = f"{tp2:.2f}"
+
+        logger.info(
+            f"Fixed levels for "
+            f"{analysis.trade_idea}: "
+            f"SL={sl:.2f}, "
+            f"TP1={tp1:.2f}, TP2={tp2:.2f}"
+        )
 
         return analysis
 
-    def _get_entry_midpoint(
-        self, entry: str
+    # ──────────────────────────────────────────────
+    # Price parsing helpers
+    # ──────────────────────────────────────────────
+    @staticmethod
+    def _parse_single_price(
+        text: str,
     ) -> Optional[float]:
-        """Extract midpoint from entry range."""
-        if not entry or entry == "N/A":
+        """Extract a single float from price text."""
+        if not text or text == "N/A":
             return None
-
-        # Try range: "1234.56-1240.00"
-        range_match = re.search(
-            r'(\d+\.?\d*)\s*[-–]\s*(\d+\.?\d*)',
-            entry,
+        cleaned = (
+            text.replace("$", "")
+            .replace(",", "")
+            .strip()
         )
-        if range_match:
-            low = float(range_match.group(1))
-            high = float(range_match.group(2))
-            return (low + high) / 2
-
-        # Try single price
-        single_match = re.search(
-            r'(\d+\.?\d+)', entry
-        )
-        if single_match:
-            return float(single_match.group(1))
-
-        return None
-
-    def _parse_float(
-        self, value: str
-    ) -> Optional[float]:
-        """Safely parse a price string to float."""
-        if not value or value == "N/A":
-            return None
-        match = re.search(r'(\d+\.?\d*)', value)
-        if match:
+        numbers = re.findall(r'\d+\.?\d*', cleaned)
+        if numbers:
             try:
-                return float(match.group(1))
+                return float(numbers[0])
             except ValueError:
                 return None
         return None
 
-    # ──────────────────────────────────────────────────
-    # Fallback Generator (DIRECTION-AWARE)
-    # ──────────────────────────────────────────────────
+    @staticmethod
+    def _parse_mid_price(
+        text: str,
+    ) -> Optional[float]:
+        """
+        Parse entry price — if range, return midpoint.
+        "2350.00-2360.00" -> 2355.00
+        "2350.00" -> 2350.00
+        """
+        if not text or text == "N/A":
+            return None
+        cleaned = (
+            text.replace("$", "")
+            .replace(",", "")
+            .strip()
+        )
+        numbers = re.findall(r'\d+\.?\d*', cleaned)
+        if not numbers:
+            return None
+        try:
+            if len(numbers) >= 2:
+                return (
+                    float(numbers[0])
+                    + float(numbers[1])
+                ) / 2
+            return float(numbers[0])
+        except ValueError:
+            return None
+
+    # ──────────────────────────────────────────────
+    # Fallback Generator (direction-aware)
+    # ──────────────────────────────────────────────
     def _generate_fallback(
         self,
         ind: AdvancedTechnicalIndicators,
         symbol: SymbolConfig,
         fund: Optional[FundamentalData],
     ) -> AIAnalysis:
-        """
-        Generate analysis from indicators when AI fails.
-        CRITICAL: SL/TP must respect trade direction.
-        """
+        """Generate indicator-based fallback with
+        correct directional SL/TP."""
         logger.warning(
-            "Generating fallback analysis from indicators"
+            "Using indicator-based fallback "
+            "(AI unavailable)"
         )
         analysis = AIAnalysis()
         price = ind.current_price
@@ -659,78 +762,89 @@ class EnhancedAIAnalyzer:
         is_bullish = "Bullish" in ind.overall_bias
         is_bearish = "Bearish" in ind.overall_bias
 
+        analysis.bias = f"{ind.overall_bias} (Indicator)"
+
         if is_bullish:
-            analysis.bias = "Bullish (Indicator-Based)"
             analysis.trade_idea = "Buy"
 
-            # Entry: near current price / pullback zone
-            entry_low = price - atr * 0.3
-            entry_high = price
+            # Entry: current price area
+            entry_low = round(price - atr * 0.3, 2)
+            entry_high = round(price, 2)
             analysis.entry = (
-                f"{entry_low:.2f}-{entry_high:.2f}"
+                f"{entry_low}-{entry_high}"
             )
             entry_mid = (entry_low + entry_high) / 2
 
-            # BUY: SL below entry, TPs above entry
-            # SL < entry < TP1 < TP2
-            sl = ind.support_1 - atr * 0.3
+            # SL: below support
+            sl = round(
+                min(ind.support_1, ind.support_2)
+                - atr * 0.3,
+                2,
+            )
             if sl >= entry_mid:
-                sl = entry_mid - atr * 1.5
+                sl = round(entry_mid - atr * 1.5, 2)
+            analysis.stop_loss = f"{sl}"
 
-            tp1 = ind.resistance_1
+            # TP1: nearest resistance
+            tp1 = round(ind.resistance_1, 2)
             if tp1 <= entry_mid:
-                tp1 = entry_mid + atr * 1.5
+                tp1 = round(entry_mid + atr * 1.5, 2)
+            analysis.take_profit_1 = f"{tp1}"
 
-            tp2 = ind.resistance_2
+            # TP2: further resistance
+            tp2 = round(ind.resistance_2, 2)
             if tp2 <= tp1:
-                tp2 = entry_mid + atr * 2.5
-
-            analysis.stop_loss = f"{sl:.2f}"
-            analysis.take_profit_1 = f"{tp1:.2f}"
-            analysis.take_profit_2 = f"{tp2:.2f}"
+                tp2 = round(tp1 + atr, 2)
+            analysis.take_profit_2 = f"{tp2}"
 
         elif is_bearish:
-            analysis.bias = "Bearish (Indicator-Based)"
             analysis.trade_idea = "Sell"
 
-            # Entry: near current price / rally zone
-            entry_low = price
-            entry_high = price + atr * 0.3
+            # Entry: current price area
+            entry_low = round(price, 2)
+            entry_high = round(price + atr * 0.3, 2)
             analysis.entry = (
-                f"{entry_low:.2f}-{entry_high:.2f}"
+                f"{entry_low}-{entry_high}"
             )
             entry_mid = (entry_low + entry_high) / 2
 
-            # SELL: SL above entry, TPs below entry
-            # TP2 < TP1 < entry < SL
-            sl = ind.resistance_1 + atr * 0.3
+            # SL: above resistance
+            sl = round(
+                max(ind.resistance_1, ind.resistance_2)
+                + atr * 0.3,
+                2,
+            )
             if sl <= entry_mid:
-                sl = entry_mid + atr * 1.5
+                sl = round(entry_mid + atr * 1.5, 2)
+            analysis.stop_loss = f"{sl}"
 
-            tp1 = ind.support_1
+            # TP1: nearest support
+            tp1 = round(ind.support_1, 2)
             if tp1 >= entry_mid:
-                tp1 = entry_mid - atr * 1.5
+                tp1 = round(entry_mid - atr * 1.5, 2)
+            analysis.take_profit_1 = f"{tp1}"
 
-            tp2 = ind.support_2
+            # TP2: further support
+            tp2 = round(ind.support_2, 2)
             if tp2 >= tp1:
-                tp2 = entry_mid - atr * 2.5
-
-            analysis.stop_loss = f"{sl:.2f}"
-            analysis.take_profit_1 = f"{tp1:.2f}"
-            analysis.take_profit_2 = f"{tp2:.2f}"
+                tp2 = round(tp1 - atr, 2)
+            analysis.take_profit_2 = f"{tp2}"
 
         else:
-            analysis.bias = "Neutral (Indicator-Based)"
             analysis.trade_idea = "Wait"
             analysis.entry = "Wait for clearer signal"
-            analysis.stop_loss = "N/A"
-            analysis.take_profit_1 = "N/A"
-            analysis.take_profit_2 = "N/A"
+            analysis.stop_loss = f"{ind.support_1}"
+            analysis.take_profit_1 = (
+                f"{ind.resistance_1}"
+            )
+            analysis.take_profit_2 = (
+                f"{ind.resistance_2}"
+            )
 
         analysis.risk_note = (
             f"{ind.volatility_condition}. "
-            f"AI unavailable — using indicator fallback. "
-            f"Confidence: {ind.confidence_score}%."
+            f"Confidence: {ind.confidence_score}%. "
+            f"AI unavailable — indicator fallback."
         )
         analysis.short_term_outlook = ind.key_insight
 
@@ -739,26 +853,21 @@ class EnhancedAIAnalyzer:
                 fund.combined_score
             )
             analysis.combined_verdict = (
-                f"Technical: {ind.overall_bias}, "
+                f"Tech: {ind.overall_bias}, "
                 f"Fundamental: "
                 f"{fund.fundamental_bias}"
             )
-        else:
-            analysis.fundamental_note = "N/A"
-            analysis.combined_verdict = (
-                f"Technical: {ind.overall_bias}"
-            )
 
         analysis.raw_response = (
-            "[Fallback: Generated from indicators]"
+            "[Fallback: indicator-based analysis]"
         )
 
         logger.info(
-            f"Fallback: {analysis.trade_idea} | "
-            f"Entry={analysis.entry} | "
-            f"SL={analysis.stop_loss} | "
-            f"TP1={analysis.take_profit_1} | "
-            f"TP2={analysis.take_profit_2}"
+            f"Fallback: {analysis.trade_idea} "
+            f"entry={analysis.entry} "
+            f"sl={analysis.stop_loss} "
+            f"tp1={analysis.take_profit_1} "
+            f"tp2={analysis.take_profit_2}"
         )
 
         return analysis
