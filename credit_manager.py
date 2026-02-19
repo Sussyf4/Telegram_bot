@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
 """
 ╔══════════════════════════════════════════════════════════════════════╗
-║                      CREDIT MANAGER                                ║
+║                      CREDIT MANAGER v4.1                           ║
 ║                                                                    ║
-║  Provides the @require_credit decorator and credit helpers.        ║
-║  UPDATED: Deny messages include direct owner contact link.         ║
+║  UPDATED: Support variable credit cost per command.                ║
+║  @require_credit(cost=1) or @require_credit(cost=4)               ║
 ╚══════════════════════════════════════════════════════════════════════╝
 """
 
@@ -22,7 +22,7 @@ import db
 logger = logging.getLogger("XAUUSD_Bot.credits")
 
 # ---------------------------------------------------------------------------
-# Owner constants (single source of truth)
+# Owner constants
 # ---------------------------------------------------------------------------
 OWNER_ID: int = 5482019561
 OWNER_USERNAME: str = "@EK_HENG"
@@ -40,11 +40,7 @@ def h(text) -> str:
     return html_escape(text, quote=False)
 
 
-# ==========================================================================
-# Build owner contact link
-# ==========================================================================
 def _owner_link() -> str:
-    """Return clickable HTML link to owner's Telegram."""
     username_clean = OWNER_USERNAME.lstrip("@")
     return (
         f'<a href="https://t.me/{username_clean}">'
@@ -53,17 +49,19 @@ def _owner_link() -> str:
 
 
 # ==========================================================================
-# Core credit check
+# Core credit check (supports variable cost)
 # ==========================================================================
 async def check_and_deduct(
     user_id: int,
     username: str | None = None,
+    cost: int = 1,
 ) -> tuple[bool, str]:
     """
     Returns (allowed: bool, deny_message_html: str).
 
+    cost: number of credits to deduct (default 1).
     Owner -> always allowed, no deduction.
-    Others -> daily reset check, limit check, then deduct.
+    Others -> daily reset, limit check, deduct.
     """
     if user_id == OWNER_ID:
         return True, ""
@@ -74,114 +72,136 @@ async def check_and_deduct(
     role = user["role"]
     used = user["daily_used"]
     limit = user["daily_limit"]
+    remaining = limit - used
 
-    if used >= limit:
+    if remaining < cost:
         if role == "free":
             msg = (
-                "🚫 <b>Daily limit reached</b>\n"
-                "━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
-                "\n"
-                f"Free users get <b>{FREE_DAILY_LIMIT}</b> "
+                "🚫 <b>Insufficient credits</b>\n"
+                "━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
+                f"This command costs "
+                f"<b>{cost}</b> credit(s).\n"
+                f"You have <b>{max(0, remaining)}</b> "
+                f"remaining "
+                f"({used}/{limit} used).\n\n"
+                f"Free users get "
+                f"<b>{FREE_DAILY_LIMIT}</b> "
                 f"commands/day.\n"
-                f"You've used <b>{used}/{limit}</b>.\n\n"
-                "⏰ Resets at <code>00:00 UTC</code>.\n"
-                "\n"
-                "━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
-                "\n"
-                "💎 <b>Want more?</b> Upgrade to Premium!\n"
+                "⏰ Resets at <code>00:00 UTC</code>.\n\n"
+                "━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
+                "💎 <b>Want more?</b> "
+                "Upgrade to Premium!\n"
                 f"📩 Contact: {_owner_link()}\n"
-                f"📋 Your ID: <code>{user_id}</code>\n"
-                "\n"
+                f"📋 Your ID: <code>{user_id}</code>\n\n"
                 "Or use /upgrade for details."
             )
         else:
             msg = (
-                "🚫 <b>Daily limit reached</b>\n"
-                "━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
-                "\n"
+                "🚫 <b>Insufficient credits</b>\n"
+                "━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
+                f"This command costs "
+                f"<b>{cost}</b> credit(s).\n"
+                f"You have <b>{max(0, remaining)}</b> "
+                f"remaining "
+                f"({used}/{limit} used).\n\n"
                 f"Premium users get "
                 f"<b>{PREMIUM_DAILY_LIMIT}</b> "
                 f"commands/day.\n"
-                f"You've used <b>{used}/{limit}</b>.\n\n"
-                "⏰ Resets at <code>00:00 UTC</code>.\n"
-                "\n"
-                "━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
-                "\n"
+                "⏰ Resets at <code>00:00 UTC</code>.\n\n"
+                "━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
                 f"Need more? Contact: {_owner_link()}"
             )
         return False, msg
 
-    await db.increment_usage(user_id)
+    # Deduct the cost
+    await db.increment_usage(user_id, amount=cost)
     await db.increment_api_counter("total_commands")
     return True, ""
 
 
 # ==========================================================================
-# Decorator
+# Decorator (supports variable cost)
 # ==========================================================================
 def require_credit(
-    func: Callable[..., Awaitable],
+    func: Callable[..., Awaitable] = None,
+    *,
+    cost: int = 1,
 ) -> Callable[..., Awaitable]:
     """
     Decorator for Telegram command handlers.
 
-    Before the wrapped handler executes:
-        1. Checks / creates user in DB.
-        2. Resets daily counter if new UTC day.
-        3. Blocks if over limit (sends message with upgrade link).
-        4. Deducts 1 credit.
-        5. Owner is never blocked or deducted.
+    Usage:
+        @require_credit            # costs 1 credit
+        async def cmd_price(...):
+
+        @require_credit(cost=4)    # costs 4 credits
+        async def cmd_fullreport(...):
     """
+    def decorator(
+        fn: Callable[..., Awaitable],
+    ) -> Callable[..., Awaitable]:
 
-    @functools.wraps(func)
-    async def wrapper(
-        update: Update,
-        context: ContextTypes.DEFAULT_TYPE,
-        *args,
-        **kwargs,
-    ):
-        user = update.effective_user
-        if user is None:
-            return
+        @functools.wraps(fn)
+        async def wrapper(
+            update: Update,
+            context: ContextTypes.DEFAULT_TYPE,
+            *args,
+            **kwargs,
+        ):
+            user = update.effective_user
+            if user is None:
+                return
 
-        user_id = user.id
-        username = user.username
+            user_id = user.id
+            username = user.username
 
-        allowed, deny_msg = await check_and_deduct(
-            user_id, username
-        )
-
-        if not allowed:
-            await update.message.reply_text(
-                deny_msg,
-                parse_mode=ParseMode.HTML,
-                disable_web_page_preview=True,
+            allowed, deny_msg = await check_and_deduct(
+                user_id, username, cost=cost
             )
+
+            if not allowed:
+                await update.message.reply_text(
+                    deny_msg,
+                    parse_mode=ParseMode.HTML,
+                    disable_web_page_preview=True,
+                )
+                logger.info(
+                    f"Credit denied for {user_id} "
+                    f"(@{username}) — "
+                    f"needed {cost} credits"
+                )
+                return
+
+            remaining = await get_remaining(user_id)
             logger.info(
-                f"Credit denied for user {user_id} "
-                f"(@{username})"
+                f"Credit OK for {user_id} "
+                f"(@{username}) — "
+                f"deducted {cost}, "
+                f"{remaining} remaining"
             )
-            return
 
-        remaining = await get_remaining(user_id)
-        logger.info(
-            f"Credit OK for user {user_id} (@{username}) — "
-            f"{remaining} remaining today"
-        )
+            return await fn(
+                update, context, *args, **kwargs
+            )
 
-        return await func(update, context, *args, **kwargs)
+        return wrapper
 
-    return wrapper
+    # Handle both @require_credit and
+    # @require_credit(cost=4)
+    if func is not None:
+        # Called as @require_credit without parens
+        return decorator(func)
+    else:
+        # Called as @require_credit(cost=4)
+        return decorator
 
 
 # ==========================================================================
 # Helpers
 # ==========================================================================
 async def get_remaining(user_id: int) -> int | str:
-    """Return credits left today, or '∞' for the owner."""
     if user_id == OWNER_ID:
         return "∞"
-
     user = await db.get_or_create_user(user_id)
     user = await db.reset_daily_if_needed(user_id)
     return max(0, user["daily_limit"] - user["daily_used"])
