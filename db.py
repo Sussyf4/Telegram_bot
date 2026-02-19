@@ -3,13 +3,12 @@
 ╔══════════════════════════════════════════════════════════════════════╗
 ║                    DATABASE LAYER (PostgreSQL)                      ║
 ║                                                                    ║
-║  RENDER-COMPATIBLE: Handles SSL, postgres:// prefix fix,           ║
-║  connection retry, and graceful shutdown.                           ║
+║  Async PostgreSQL connection pool using asyncpg.                   ║
+║  UPDATED: increment_usage supports variable amount.                ║
 ╚══════════════════════════════════════════════════════════════════════╝
 """
 
 import os
-import ssl
 import logging
 from datetime import date
 from typing import Optional
@@ -23,36 +22,7 @@ logger = logging.getLogger("XAUUSD_Bot.db")
 # ---------------------------------------------------------------------------
 _pool: Optional[asyncpg.Pool] = None
 
-
-def _get_database_url() -> str:
-    """
-    Get and fix DATABASE_URL for asyncpg compatibility.
-
-    Render provides: postgres://user:pass@host/db
-    asyncpg needs:   postgresql://user:pass@host/db
-
-    Also handles Railway, Supabase, Neon, etc.
-    """
-    raw_url = os.getenv("DATABASE_URL", "")
-
-    if not raw_url:
-        raise EnvironmentError(
-            "DATABASE_URL environment variable is not set. "
-            "Please configure it in Render dashboard."
-        )
-
-    # Fix Render's postgres:// prefix
-    if raw_url.startswith("postgres://"):
-        raw_url = raw_url.replace(
-            "postgres://", "postgresql://", 1
-        )
-        logger.info(
-            "Fixed DATABASE_URL prefix: "
-            "postgres:// → postgresql://"
-        )
-
-    return raw_url
-
+DATABASE_URL = os.getenv("DATABASE_URL")
 
 # ---------------------------------------------------------------------------
 # Schema
@@ -82,68 +52,32 @@ CREATE TABLE IF NOT EXISTS api_stats (
 # ==========================================================================
 # Pool lifecycle
 # ==========================================================================
-async def init_pool(max_retries: int = 5) -> asyncpg.Pool:
-    """
-    Create the connection pool with Render SSL support.
-    Retries on failure (Render DB may take a moment to wake).
-    """
+async def init_pool() -> asyncpg.Pool:
+    """Create the connection pool and ensure tables exist."""
     global _pool
 
-    database_url = _get_database_url()
-    logger.info("Connecting to PostgreSQL (Render)...")
+    if not DATABASE_URL:
+        raise EnvironmentError(
+            "DATABASE_URL environment variable is not set. "
+            "Please configure it for Railway PostgreSQL."
+        )
 
-    # Render free-tier PostgreSQL requires SSL
-    # Create SSL context that doesn't verify certs
-    # (Render uses self-signed certs on free tier)
-    ssl_ctx = ssl.create_default_context()
-    ssl_ctx.check_hostname = False
-    ssl_ctx.verify_mode = ssl.CERT_NONE
+    logger.info("Connecting to PostgreSQL...")
 
-    last_error = None
-    for attempt in range(1, max_retries + 1):
-        try:
-            _pool = await asyncpg.create_pool(
-                database_url,
-                min_size=1,
-                max_size=5,
-                command_timeout=30,
-                statement_cache_size=0,
-                ssl=ssl_ctx,
-            )
-
-            # Verify connection and create tables
-            async with _pool.acquire() as conn:
-                await conn.execute(CREATE_TABLE_SQL)
-                await conn.execute(
-                    CREATE_API_STATS_TABLE_SQL
-                )
-
-            logger.info(
-                f"PostgreSQL pool ready on attempt "
-                f"{attempt} — tables verified."
-            )
-            return _pool
-
-        except Exception as exc:
-            last_error = exc
-            logger.warning(
-                f"DB connection attempt "
-                f"{attempt}/{max_retries} failed: "
-                f"{exc}"
-            )
-            if attempt < max_retries:
-                import asyncio
-                wait = attempt * 3
-                logger.info(
-                    f"Retrying in {wait}s..."
-                )
-                await asyncio.sleep(wait)
-
-    raise ConnectionError(
-        f"Failed to connect to PostgreSQL after "
-        f"{max_retries} attempts. Last error: "
-        f"{last_error}"
+    _pool = await asyncpg.create_pool(
+        DATABASE_URL,
+        min_size=2,
+        max_size=10,
+        command_timeout=15,
+        statement_cache_size=0,
     )
+
+    async with _pool.acquire() as conn:
+        await conn.execute(CREATE_TABLE_SQL)
+        await conn.execute(CREATE_API_STATS_TABLE_SQL)
+
+    logger.info("PostgreSQL pool ready — tables verified.")
+    return _pool
 
 
 async def close_pool() -> None:
@@ -172,6 +106,10 @@ async def get_or_create_user(
     user_id: int,
     username: Optional[str] = None,
 ) -> dict:
+    """
+    Fetch existing user or insert a new FREE user.
+    Returns a dict with all column values.
+    """
     pool = get_pool()
 
     async with pool.acquire() as conn:
@@ -214,6 +152,10 @@ async def get_or_create_user(
 
 
 async def reset_daily_if_needed(user_id: int) -> dict:
+    """
+    If the user's last_reset is before today (UTC),
+    zero out daily_used and stamp today.
+    """
     pool = get_pool()
     today = date.today()
 
@@ -254,6 +196,7 @@ async def reset_daily_if_needed(user_id: int) -> dict:
 async def increment_usage(
     user_id: int, amount: int = 1
 ) -> None:
+    """Atomically bump daily_used by `amount`."""
     pool = get_pool()
     await pool.execute(
         "UPDATE users "
@@ -269,6 +212,10 @@ async def set_role(
     role: str,
     daily_limit: int,
 ) -> bool:
+    """
+    Change a user's role and daily_limit.
+    Returns True if a row was actually updated.
+    """
     if role not in ("free", "premium", "owner"):
         raise ValueError(f"Invalid role: {role}")
 
