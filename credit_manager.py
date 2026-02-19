@@ -1,10 +1,11 @@
 #!/usr/bin/env python3
 """
 ╔══════════════════════════════════════════════════════════════════════╗
-║                      CREDIT MANAGER v4.1                           ║
+║                      CREDIT MANAGER v2                             ║
 ║                                                                    ║
-║  UPDATED: Support variable credit cost per command.                ║
-║  @require_credit(cost=1) or @require_credit(cost=4)               ║
+║  @require_credit(cost=1) — default 1 credit                       ║
+║  @require_credit(cost=4) — for expensive commands                  ║
+║  Owner always bypassed. HTML parse mode.                           ║
 ╚══════════════════════════════════════════════════════════════════════╝
 """
 
@@ -22,7 +23,7 @@ import db
 logger = logging.getLogger("XAUUSD_Bot.credits")
 
 # ---------------------------------------------------------------------------
-# Owner constants
+# Owner constants (single source of truth)
 # ---------------------------------------------------------------------------
 OWNER_ID: int = 5482019561
 OWNER_USERNAME: str = "@EK_HENG"
@@ -40,6 +41,9 @@ def h(text) -> str:
     return html_escape(text, quote=False)
 
 
+# ==========================================================================
+# Build owner contact link
+# ==========================================================================
 def _owner_link() -> str:
     username_clean = OWNER_USERNAME.lstrip("@")
     return (
@@ -49,7 +53,7 @@ def _owner_link() -> str:
 
 
 # ==========================================================================
-# Core credit check (supports variable cost)
+# Core credit check — now supports variable cost
 # ==========================================================================
 async def check_and_deduct(
     user_id: int,
@@ -59,9 +63,8 @@ async def check_and_deduct(
     """
     Returns (allowed: bool, deny_message_html: str).
 
-    cost: number of credits to deduct (default 1).
     Owner -> always allowed, no deduction.
-    Others -> daily reset, limit check, deduct.
+    Others -> daily reset, limit check, then deduct `cost` credits.
     """
     if user_id == OWNER_ID:
         return True, ""
@@ -74,23 +77,21 @@ async def check_and_deduct(
     limit = user["daily_limit"]
     remaining = limit - used
 
+    # Check if user has ENOUGH credits for this command
     if remaining < cost:
         if role == "free":
             msg = (
                 "🚫 <b>Insufficient credits</b>\n"
                 "━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
-                f"This command costs "
-                f"<b>{cost}</b> credit(s).\n"
-                f"You have <b>{max(0, remaining)}</b> "
-                f"remaining "
-                f"({used}/{limit} used).\n\n"
-                f"Free users get "
-                f"<b>{FREE_DAILY_LIMIT}</b> "
+                f"This command costs <b>{cost}</b> "
+                f"credit{'s' if cost > 1 else ''}.\n"
+                f"You have <b>{remaining}</b> remaining "
+                f"(used {used}/{limit}).\n\n"
+                f"Free users get <b>{FREE_DAILY_LIMIT}</b> "
                 f"commands/day.\n"
                 "⏰ Resets at <code>00:00 UTC</code>.\n\n"
                 "━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
-                "💎 <b>Want more?</b> "
-                "Upgrade to Premium!\n"
+                "💎 <b>Want more?</b> Upgrade to Premium!\n"
                 f"📩 Contact: {_owner_link()}\n"
                 f"📋 Your ID: <code>{user_id}</code>\n\n"
                 "Or use /upgrade for details."
@@ -99,11 +100,10 @@ async def check_and_deduct(
             msg = (
                 "🚫 <b>Insufficient credits</b>\n"
                 "━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
-                f"This command costs "
-                f"<b>{cost}</b> credit(s).\n"
-                f"You have <b>{max(0, remaining)}</b> "
-                f"remaining "
-                f"({used}/{limit} used).\n\n"
+                f"This command costs <b>{cost}</b> "
+                f"credit{'s' if cost > 1 else ''}.\n"
+                f"You have <b>{remaining}</b> remaining "
+                f"(used {used}/{limit}).\n\n"
                 f"Premium users get "
                 f"<b>{PREMIUM_DAILY_LIMIT}</b> "
                 f"commands/day.\n"
@@ -113,34 +113,40 @@ async def check_and_deduct(
             )
         return False, msg
 
-    # Deduct the cost
+    # Deduct the full cost
     await db.increment_usage(user_id, amount=cost)
     await db.increment_api_counter("total_commands")
     return True, ""
 
 
 # ==========================================================================
-# Decorator (supports variable cost)
+# Decorator — now accepts cost parameter
 # ==========================================================================
 def require_credit(
     func: Callable[..., Awaitable] = None,
     *,
     cost: int = 1,
-) -> Callable[..., Awaitable]:
+):
     """
     Decorator for Telegram command handlers.
 
     Usage:
-        @require_credit            # costs 1 credit
+        @require_credit              # costs 1 credit
         async def cmd_price(...):
 
-        @require_credit(cost=4)    # costs 4 credits
+        @require_credit(cost=4)      # costs 4 credits
         async def cmd_fullreport(...):
-    """
-    def decorator(
-        fn: Callable[..., Awaitable],
-    ) -> Callable[..., Awaitable]:
 
+    Before the wrapped handler executes:
+        1. Checks / creates user in DB.
+        2. Resets daily counter if new UTC day.
+        3. Checks if user has enough credits for `cost`.
+        4. Blocks if insufficient (sends message).
+        5. Deducts `cost` credits.
+        6. Owner is never blocked or deducted.
+    """
+
+    def decorator(fn: Callable[..., Awaitable]):
         @functools.wraps(fn)
         async def wrapper(
             update: Update,
@@ -166,17 +172,16 @@ def require_credit(
                     disable_web_page_preview=True,
                 )
                 logger.info(
-                    f"Credit denied for {user_id} "
-                    f"(@{username}) — "
-                    f"needed {cost} credits"
+                    f"Credit denied for user {user_id} "
+                    f"(@{username}) — needs {cost}, "
+                    f"insufficient"
                 )
                 return
 
             remaining = await get_remaining(user_id)
             logger.info(
-                f"Credit OK for {user_id} "
-                f"(@{username}) — "
-                f"deducted {cost}, "
+                f"Credit OK: user {user_id} "
+                f"(@{username}) charged {cost}, "
                 f"{remaining} remaining"
             )
 
@@ -186,13 +191,12 @@ def require_credit(
 
         return wrapper
 
-    # Handle both @require_credit and
-    # @require_credit(cost=4)
+    # Handle both @require_credit and @require_credit(cost=4)
     if func is not None:
-        # Called as @require_credit without parens
+        # Called as @require_credit without parentheses
         return decorator(func)
     else:
-        # Called as @require_credit(cost=4)
+        # Called as @require_credit(cost=4) with parentheses
         return decorator
 
 
@@ -200,8 +204,10 @@ def require_credit(
 # Helpers
 # ==========================================================================
 async def get_remaining(user_id: int) -> int | str:
+    """Return credits left today, or '∞' for the owner."""
     if user_id == OWNER_ID:
         return "∞"
+
     user = await db.get_or_create_user(user_id)
     user = await db.reset_daily_if_needed(user_id)
     return max(0, user["daily_limit"] - user["daily_used"])
