@@ -1,0 +1,37 @@
+# render.yaml — place in project root
+# This file tells Render exactly how to deploy your bot
+
+services:
+  - type: worker
+    name: xauusd-btc-ai-bot
+    runtime: python
+    region: singapore  # Change to: oregon, frankfurt, ohio, singapore
+    plan: starter      # starter ($7/mo) or free
+    buildCommand: |
+      pip install --upgrade pip &&
+      pip install -r requirements.txt
+    startCommand: python bot.py
+    envVars:
+      - key: TELEGRAM_BOT_TOKEN
+        sync: false  # Set manually in dashboard
+      - key: TWELVEDATA_API_KEY
+        sync: false
+      - key: GEMINI_API_KEY
+        sync: false
+      - key: DATABASE_URL
+        sync: false
+      - key: PYTHON_VERSION
+        value: "3.13.0"
+      - key: TZ
+        value: "UTC"
+      - key: PYTHONUNBUFFERED
+        value: "1"
+
+# Optional: If you want Render-managed PostgreSQL
+# (otherwise use Neon, Supabase, or Railway DB externally)
+databases:
+  - name: xauusd-bot-db
+    plan: starter  # starter ($7/mo) or free
+    databaseName: botdb
+    user: botuser
+    region: singapore
