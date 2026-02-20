@@ -3,12 +3,13 @@
 ╔══════════════════════════════════════════════════════════════════════╗
 ║                    DATABASE LAYER (PostgreSQL)                      ║
 ║                                                                    ║
-║  Async PostgreSQL connection pool using asyncpg.                   ║
-║  UPDATED: increment_usage supports variable amount.                ║
+║  Optimized for Neon PostgreSQL on Replit.                          ║
+║  Handles SSL, connection pooling, URL normalization.               ║
 ╚══════════════════════════════════════════════════════════════════════╝
 """
 
 import os
+import ssl
 import logging
 from datetime import date
 from typing import Optional
@@ -17,17 +18,62 @@ import asyncpg
 
 logger = logging.getLogger("XAUUSD_Bot.db")
 
-# ---------------------------------------------------------------------------
-# Singleton pool holder
-# ---------------------------------------------------------------------------
 _pool: Optional[asyncpg.Pool] = None
 
-DATABASE_URL = os.getenv("DATABASE_URL")
 
-# ---------------------------------------------------------------------------
+# ==========================================================================
+# URL Normalization
+# ==========================================================================
+def _get_database_url() -> str:
+    """
+    Get and normalize DATABASE_URL.
+    Neon uses postgresql:// but some tools give postgres://.
+    asyncpg requires postgresql://.
+    """
+    url = os.environ.get("DATABASE_URL", "")
+
+    if not url:
+        raise EnvironmentError(
+            "DATABASE_URL is not set.\n"
+            "Go to Replit → Tools → Secrets → "
+            "add DATABASE_URL\n"
+            "Get it from: Neon Dashboard → "
+            "Connection Details → Direct connection"
+        )
+
+    # Fix postgres:// → postgresql://
+    if url.startswith("postgres://"):
+        url = url.replace(
+            "postgres://", "postgresql://", 1
+        )
+
+    # Ensure sslmode is set for Neon
+    if "sslmode" not in url:
+        separator = "&" if "?" in url else "?"
+        url += f"{separator}sslmode=require"
+
+    return url
+
+
+# ==========================================================================
+# SSL Context for Neon
+# ==========================================================================
+def _create_ssl_context() -> ssl.SSLContext:
+    """
+    Neon requires SSL for all connections.
+    This creates a permissive context that works
+    with Neon's certificates.
+    """
+    ctx = ssl.create_default_context()
+    ctx.check_hostname = False
+    ctx.verify_mode = ssl.CERT_NONE
+    return ctx
+
+
+# ==========================================================================
 # Schema
-# ---------------------------------------------------------------------------
-CREATE_TABLE_SQL = """
+# ==========================================================================
+CREATE_USERS_SQL = """
 CREATE TABLE IF NOT EXISTS users (
     user_id     BIGINT PRIMARY KEY,
     username    TEXT,
@@ -39,7 +85,7 @@ CREATE TABLE IF NOT EXISTS users (
 );
 """
 
-CREATE_API_STATS_TABLE_SQL = """
+CREATE_API_STATS_SQL = """
 CREATE TABLE IF NOT EXISTS api_stats (
     stat_date        DATE PRIMARY KEY DEFAULT CURRENT_DATE,
     twelvedata_calls INTEGER NOT NULL DEFAULT 0,
@@ -50,38 +96,65 @@ CREATE TABLE IF NOT EXISTS api_stats (
 
 
 # ==========================================================================
-# Pool lifecycle
+# Pool Lifecycle
 # ==========================================================================
 async def init_pool() -> asyncpg.Pool:
-    """Create the connection pool and ensure tables exist."""
+    """Create connection pool optimized for Neon free tier."""
     global _pool
 
-    if not DATABASE_URL:
-        raise EnvironmentError(
-            "DATABASE_URL environment variable is not set. "
-            "Please configure it for Railway PostgreSQL."
+    database_url = _get_database_url()
+    ssl_context = _create_ssl_context()
+
+    logger.info("Connecting to Neon PostgreSQL...")
+
+    try:
+        _pool = await asyncpg.create_pool(
+            database_url,
+            min_size=1,         # Neon free = limited connections
+            max_size=5,         # Neon free allows ~20 concurrent
+            command_timeout=15,
+            statement_cache_size=0,
+            ssl=ssl_context,
         )
+    except asyncpg.InvalidPasswordError:
+        logger.error(
+            "❌ Database authentication failed!\n"
+            "Check your DATABASE_URL in Replit Secrets.\n"
+            "Make sure you copied the FULL connection "
+            "string from Neon Dashboard."
+        )
+        raise
+    except asyncpg.InvalidCatalogNameError:
+        logger.error(
+            "❌ Database name not found!\n"
+            "Check that 'neondb' (or your database name) "
+            "exists in your Neon project."
+        )
+        raise
+    except OSError as exc:
+        logger.error(
+            f"❌ Cannot connect to Neon: {exc}\n"
+            "Check:\n"
+            "  1. DATABASE_URL is correct\n"
+            "  2. Neon project is not suspended\n"
+            "  3. Region is accessible from Replit"
+        )
+        raise
 
-    logger.info("Connecting to PostgreSQL...")
-
-    _pool = await asyncpg.create_pool(
-        DATABASE_URL,
-        min_size=2,
-        max_size=10,
-        command_timeout=15,
-        statement_cache_size=0,
-    )
-
+    # Create tables
     async with _pool.acquire() as conn:
-        await conn.execute(CREATE_TABLE_SQL)
-        await conn.execute(CREATE_API_STATS_TABLE_SQL)
+        await conn.execute(CREATE_USERS_SQL)
+        await conn.execute(CREATE_API_STATS_SQL)
 
-    logger.info("PostgreSQL pool ready — tables verified.")
+    logger.info(
+        "✅ Neon PostgreSQL pool ready — "
+        "tables verified."
+    )
     return _pool
 
 
 async def close_pool() -> None:
-    """Gracefully close every connection in the pool."""
+    """Gracefully close the pool."""
     global _pool
     if _pool is not None:
         await _pool.close()
@@ -90,39 +163,40 @@ async def close_pool() -> None:
 
 
 def get_pool() -> asyncpg.Pool:
-    """Return the live pool or raise if not initialised."""
+    """Return live pool or raise."""
     if _pool is None:
         raise RuntimeError(
-            "Database pool is not initialised. "
+            "Database pool not initialised. "
             "Call init_pool() first."
         )
     return _pool
 
 
 # ==========================================================================
-# User helpers
+# User Helpers
 # ==========================================================================
 async def get_or_create_user(
     user_id: int,
     username: Optional[str] = None,
 ) -> dict:
-    """
-    Fetch existing user or insert a new FREE user.
-    Returns a dict with all column values.
-    """
     pool = get_pool()
 
     async with pool.acquire() as conn:
         async with conn.transaction():
             row = await conn.fetchrow(
-                "SELECT * FROM users WHERE user_id = $1",
+                "SELECT * FROM users "
+                "WHERE user_id = $1",
                 user_id,
             )
 
             if row is not None:
-                if username and row["username"] != username:
+                if (
+                    username
+                    and row["username"] != username
+                ):
                     await conn.execute(
-                        "UPDATE users SET username = $1 "
+                        "UPDATE users "
+                        "SET username = $1 "
                         "WHERE user_id = $2",
                         username,
                         user_id,
@@ -132,30 +206,32 @@ async def get_or_create_user(
             await conn.execute(
                 """
                 INSERT INTO users
-                    (user_id, username, role, daily_used,
-                     daily_limit, last_reset)
-                VALUES ($1, $2, 'free', 0, 5, CURRENT_DATE)
+                    (user_id, username, role,
+                     daily_used, daily_limit,
+                     last_reset)
+                VALUES
+                    ($1, $2, 'free', 0, 5,
+                     CURRENT_DATE)
                 """,
                 user_id,
                 username or "",
             )
 
             row = await conn.fetchrow(
-                "SELECT * FROM users WHERE user_id = $1",
+                "SELECT * FROM users "
+                "WHERE user_id = $1",
                 user_id,
             )
             logger.info(
-                f"New free user created: {user_id} "
+                f"New free user: {user_id} "
                 f"(@{username})"
             )
             return dict(row)
 
 
-async def reset_daily_if_needed(user_id: int) -> dict:
-    """
-    If the user's last_reset is before today (UTC),
-    zero out daily_used and stamp today.
-    """
+async def reset_daily_if_needed(
+    user_id: int,
+) -> dict:
     pool = get_pool()
     today = date.today()
 
@@ -168,7 +244,9 @@ async def reset_daily_if_needed(user_id: int) -> dict:
             )
 
             if row is None:
-                return await get_or_create_user(user_id)
+                return await get_or_create_user(
+                    user_id
+                )
 
             if row["last_reset"] < today:
                 await conn.execute(
@@ -182,7 +260,7 @@ async def reset_daily_if_needed(user_id: int) -> dict:
                     user_id,
                 )
                 logger.info(
-                    f"Daily reset for user {user_id}"
+                    f"Daily reset: user {user_id}"
                 )
                 row = await conn.fetchrow(
                     "SELECT * FROM users "
@@ -196,7 +274,7 @@ async def reset_daily_if_needed(user_id: int) -> dict:
 async def increment_usage(
     user_id: int, amount: int = 1
 ) -> None:
-    """Atomically bump daily_used by `amount`."""
+    """Atomically bump daily_used."""
     pool = get_pool()
     await pool.execute(
         "UPDATE users "
@@ -212,21 +290,15 @@ async def set_role(
     role: str,
     daily_limit: int,
 ) -> bool:
-    """
-    Change a user's role and daily_limit.
-    Returns True if a row was actually updated.
-    """
     if role not in ("free", "premium", "owner"):
         raise ValueError(f"Invalid role: {role}")
 
     pool = get_pool()
-
     async with pool.acquire() as conn:
         result = await conn.execute(
             """
             UPDATE users
-               SET role = $1,
-                   daily_limit = $2
+               SET role = $1, daily_limit = $2
              WHERE user_id = $3
             """,
             role,
@@ -237,7 +309,7 @@ async def set_role(
 
 
 # ==========================================================================
-# Stats helpers
+# Stats Helpers
 # ==========================================================================
 async def get_all_user_stats() -> dict:
     pool = get_pool()
@@ -258,8 +330,7 @@ async def get_all_user_stats() -> dict:
         today_cmds = await conn.fetchval(
             """
             SELECT COALESCE(SUM(daily_used), 0)
-              FROM users
-             WHERE last_reset = $1
+              FROM users WHERE last_reset = $1
             """,
             today,
         )
@@ -289,13 +360,11 @@ async def get_api_stats_today() -> dict:
             "gemini_calls": 0,
             "total_commands": 0,
         }
-
     return dict(row)
 
 
 async def increment_api_counter(
-    column: str,
-    amount: int = 1,
+    column: str, amount: int = 1
 ) -> None:
     allowed = {
         "twelvedata_calls",
@@ -304,7 +373,7 @@ async def increment_api_counter(
     }
     if column not in allowed:
         raise ValueError(
-            f"Invalid counter column: {column}"
+            f"Invalid counter: {column}"
         )
 
     pool = get_pool()
@@ -315,7 +384,8 @@ async def increment_api_counter(
         INSERT INTO api_stats (stat_date, {column})
         VALUES ($1, $2)
         ON CONFLICT (stat_date)
-        DO UPDATE SET {column} = api_stats.{column} + $2
+        DO UPDATE SET {column} =
+            api_stats.{column} + $2
         """,
         today,
         amount,
