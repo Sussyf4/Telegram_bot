@@ -26,7 +26,6 @@ local autoPetOn = false
 local autoRejoinOn = false
 local minimized = false
 local selectedLevel = nil
-local currentCategory = "AutoFarm"
 local farmSpeed = 0.5
 local touchHits = 5
 
@@ -163,12 +162,64 @@ local function firePetEggBuy()
 	if PetEggBuyRemote then PetEggBuyRemote:FireServer(30)
 	else
 		pcall(function() ReplicatedStorage["PetEgg/PetEggBuy"]:FireServer(30) end)
-		pcall(function() ReplicatedStorage.PetEgg.PetEggBuy:FireServer(30) end)
 	end
 end
 
 -- ========================
--- TELEPORT BEHIND + FIRE TOUCH
+-- AUTO ATTACK REMOTE
+-- Setting/ChangeSetting with "AutoAttack" true/false
+-- The remote name literally has a slash in it
+-- ========================
+local function fireAutoAttack(enabled)
+	-- Try all possible ways to find and fire this remote
+	local fired = false
+
+	-- Method 1: bracket notation (name has slash)
+	pcall(function()
+		ReplicatedStorage["Setting/ChangeSetting"]:FireServer("AutoAttack", enabled)
+		fired = true
+	end)
+
+	if not fired then
+		-- Method 2: folder path
+		pcall(function()
+			ReplicatedStorage.Setting.ChangeSetting:FireServer("AutoAttack", enabled)
+			fired = true
+		end)
+	end
+
+	if not fired then
+		-- Method 3: search all descendants
+		pcall(function()
+			for _, desc in ipairs(ReplicatedStorage:GetDescendants()) do
+				if desc.Name == "ChangeSetting" and (desc:IsA("RemoteEvent") or desc:IsA("RemoteFunction")) then
+					desc:FireServer("AutoAttack", enabled)
+					fired = true
+					break
+				end
+			end
+		end)
+	end
+
+	if not fired then
+		-- Method 4: search by exact full name
+		pcall(function()
+			for _, child in ipairs(ReplicatedStorage:GetChildren()) do
+				if child.Name == "Setting/ChangeSetting" then
+					child:FireServer("AutoAttack", enabled)
+					fired = true
+					break
+				end
+			end
+		end)
+	end
+
+	return fired
+end
+
+-- ========================
+-- TELEPORT BEHIND MONSTER + FIRE TOUCH
+-- Teleport to same Y as monster, NOT above
 -- ========================
 local function teleportAndAttack(monsterModel)
 	if not monsterModel or not monsterModel.Parent then return false end
@@ -184,15 +235,23 @@ local function teleportAndAttack(monsterModel)
 	local touchInterest = attackPart:FindFirstChild("TouchInterest")
 	if not touchInterest then return false end
 
-	local monsterCF = monsterModel:GetPivot()
-	local monsterPos = monsterCF.Position
-	local monsterLook = monsterCF.LookVector
+	-- Get monster position and facing
+	local mPos = monsterRoot.Position
+	local mLook = monsterRoot.CFrame.LookVector
 
-	local behindPos = monsterPos - (monsterLook * 4)
-	myRoot.CFrame = CFrame.new(behindPos, monsterPos)
+	-- Behind monster: same Y, 4 studs behind where monster faces
+	local behindPos = Vector3.new(
+		mPos.X - mLook.X * 4,
+		mPos.Y,
+		mPos.Z - mLook.Z * 4
+	)
+
+	-- Face toward monster
+	myRoot.CFrame = CFrame.new(behindPos, Vector3.new(mPos.X, behindPos.Y, mPos.Z))
 	myRoot.AssemblyLinearVelocity = Vector3.zero
 	myRoot.AssemblyAngularVelocity = Vector3.zero
 
+	-- Fire touch
 	if firetouchinterest then
 		pcall(function()
 			firetouchinterest(myRoot, attackPart, 0)
@@ -264,7 +323,7 @@ local C = {
 }
 
 -- ========================
--- GUI
+-- GUI SETUP
 -- ========================
 local Gui = Instance.new("ScreenGui")
 Gui.Name = "BusHub"
@@ -294,6 +353,7 @@ shadow.SliceCenter = Rect.new(49, 49, 450, 450)
 shadow.ZIndex = 0
 shadow.Parent = Main
 
+-- TITLE BAR
 local Bar = Instance.new("Frame")
 Bar.Size = UDim2.new(1, 0, 0, 40)
 Bar.BackgroundColor3 = C.bar
@@ -314,22 +374,20 @@ accentLine.BackgroundColor3 = C.barAccent
 accentLine.BorderSizePixel = 0
 accentLine.Parent = Bar
 
-local Logo = Instance.new("TextLabel")
-Logo.Size = UDim2.new(0, 130, 1, 0)
-Logo.Position = UDim2.new(0, 14, 0, 0)
-Logo.BackgroundTransparency = 1
-Logo.Text = "🚌 BUS HUB"
-Logo.TextColor3 = C.txt
-Logo.TextSize = 16
-Logo.Font = Enum.Font.GothamBold
-Logo.TextXAlignment = Enum.TextXAlignment.Left
-Logo.Parent = Bar
+Instance.new("TextLabel", Bar).Size = UDim2.new(0, 130, 1, 0)
+Bar:FindFirstChildOfClass("TextLabel").Position = UDim2.new(0, 14, 0, 0)
+Bar:FindFirstChildOfClass("TextLabel").BackgroundTransparency = 1
+Bar:FindFirstChildOfClass("TextLabel").Text = "🚌 BUS HUB"
+Bar:FindFirstChildOfClass("TextLabel").TextColor3 = C.txt
+Bar:FindFirstChildOfClass("TextLabel").TextSize = 16
+Bar:FindFirstChildOfClass("TextLabel").Font = Enum.Font.GothamBold
+Bar:FindFirstChildOfClass("TextLabel").TextXAlignment = Enum.TextXAlignment.Left
 
 local VerLbl = Instance.new("TextLabel")
 VerLbl.Size = UDim2.new(0, 36, 0, 16)
 VerLbl.Position = UDim2.new(0, 132, 0.5, -8)
 VerLbl.BackgroundColor3 = C.acc
-VerLbl.Text = "v5.1"
+VerLbl.Text = "v5.2"
 VerLbl.TextColor3 = Color3.new(1, 1, 1)
 VerLbl.TextSize = 9
 VerLbl.Font = Enum.Font.GothamBold
@@ -348,6 +406,7 @@ MinBtn.BorderSizePixel = 0
 MinBtn.Parent = Bar
 Instance.new("UICorner", MinBtn).CornerRadius = UDim.new(0, 6)
 
+-- TABS
 local TabBar = Instance.new("Frame")
 TabBar.Size = UDim2.new(1, -20, 0, 30)
 TabBar.Position = UDim2.new(0, 10, 0, 44)
@@ -509,7 +568,7 @@ local function mkButton(par, name, ord, color, cb)
 end
 
 -- ========================
--- SLIDER (supports float and int modes)
+-- FIXED SLIDER - one dragging state per slider, no conflicts
 -- ========================
 local function mkSlider(par, name, ord, minVal, maxVal, defaultVal, isInt, suffix, cb)
 	local container = Instance.new("Frame")
@@ -518,112 +577,102 @@ local function mkSlider(par, name, ord, minVal, maxVal, defaultVal, isInt, suffi
 	container.LayoutOrder = ord
 	container.Parent = par
 
-	local labelRow = Instance.new("Frame")
-	labelRow.Size = UDim2.new(1, 0, 0, 16)
-	labelRow.BackgroundTransparency = 1
-	labelRow.Parent = container
-
 	local nameLbl = Instance.new("TextLabel")
-	nameLbl.Size = UDim2.new(0.6, 0, 1, 0)
+	nameLbl.Size = UDim2.new(0.65, 0, 0, 16)
 	nameLbl.BackgroundTransparency = 1
 	nameLbl.Text = name
 	nameLbl.TextColor3 = C.txt
 	nameLbl.TextSize = 12
 	nameLbl.Font = Enum.Font.GothamMedium
 	nameLbl.TextXAlignment = Enum.TextXAlignment.Left
-	nameLbl.Parent = labelRow
+	nameLbl.Parent = container
 
-	local formatVal
-	if isInt then
-		formatVal = function(v) return tostring(math.floor(v)) .. suffix end
-	else
-		formatVal = function(v) return string.format("%.1f", v) .. suffix end
+	local function fmtVal(v)
+		if isInt then return tostring(math.floor(v + 0.5)) .. suffix
+		else return string.format("%.1f", v) .. suffix end
 	end
 
 	local valLbl = Instance.new("TextLabel")
-	valLbl.Size = UDim2.new(0.4, 0, 1, 0)
+	valLbl.Size = UDim2.new(0.35, 0, 0, 16)
+	valLbl.Position = UDim2.new(0.65, 0, 0, 0)
 	valLbl.BackgroundTransparency = 1
-	valLbl.Text = formatVal(defaultVal)
+	valLbl.Text = fmtVal(defaultVal)
 	valLbl.TextColor3 = C.sliderKnob
 	valLbl.TextSize = 12
 	valLbl.Font = Enum.Font.GothamBold
 	valLbl.TextXAlignment = Enum.TextXAlignment.Right
-	valLbl.Parent = labelRow
+	valLbl.Parent = container
 
-	local track = Instance.new("Frame")
-	track.Size = UDim2.new(1, 0, 0, 8)
-	track.Position = UDim2.new(0, 0, 0, 24)
+	local track = Instance.new("TextButton") -- TextButton so it captures input
+	track.Size = UDim2.new(1, 0, 0, 14)
+	track.Position = UDim2.new(0, 0, 0, 22)
 	track.BackgroundColor3 = C.sliderTrack
 	track.BorderSizePixel = 0
+	track.Text = ""
+	track.AutoButtonColor = false
 	track.Parent = container
 	Instance.new("UICorner", track).CornerRadius = UDim.new(1, 0)
 
-	local startFill = (defaultVal - minVal) / (maxVal - minVal)
+	local startPct = math.clamp((defaultVal - minVal) / (maxVal - minVal), 0, 1)
 
 	local fill = Instance.new("Frame")
-	fill.Size = UDim2.new(startFill, 0, 1, 0)
+	fill.Size = UDim2.new(startPct, 0, 1, 0)
 	fill.BackgroundColor3 = C.sliderFill
 	fill.BorderSizePixel = 0
 	fill.Parent = track
 	Instance.new("UICorner", fill).CornerRadius = UDim.new(1, 0)
 
-	local knob = Instance.new("TextButton")
-	knob.Size = UDim2.new(0, 18, 0, 18)
-	knob.Position = UDim2.new(startFill, -9, 0.5, -9)
+	local knob = Instance.new("Frame")
+	knob.Size = UDim2.new(0, 16, 0, 16)
+	knob.Position = UDim2.new(startPct, -8, 0.5, -8)
 	knob.BackgroundColor3 = C.sliderKnob
-	knob.Text = ""
 	knob.BorderSizePixel = 0
 	knob.ZIndex = 5
 	knob.Parent = track
 	Instance.new("UICorner", knob).CornerRadius = UDim.new(1, 0)
 
-	local dragging = false
+	local thisSliderDragging = false
 
-	local function update(inputX)
+	local function doUpdate(inputX)
 		local tPos = track.AbsolutePosition.X
 		local tSize = track.AbsoluteSize.X
+		if tSize == 0 then return end
 		local rel = math.clamp((inputX - tPos) / tSize, 0, 1)
 
 		fill.Size = UDim2.new(rel, 0, 1, 0)
-		knob.Position = UDim2.new(rel, -9, 0.5, -9)
+		knob.Position = UDim2.new(rel, -8, 0.5, -8)
 
 		local val = minVal + (maxVal - minVal) * rel
 		if isInt then val = math.floor(val + 0.5) end
 		if not isInt then val = math.floor(val * 10) / 10 end
+		val = math.clamp(val, minVal, maxVal)
 
-		valLbl.Text = formatVal(val)
+		valLbl.Text = fmtVal(val)
 		if cb then cb(val) end
 	end
 
-	knob.InputBegan:Connect(function(i)
-		if i.UserInputType == Enum.UserInputType.MouseButton1 or i.UserInputType == Enum.UserInputType.Touch then
-			dragging = true
+	track.MouseButton1Down:Connect(function(x, y)
+		thisSliderDragging = true
+		doUpdate(x)
+	end)
+
+	UserInputService.InputChanged:Connect(function(input)
+		if thisSliderDragging then
+			if input.UserInputType == Enum.UserInputType.MouseMovement then
+				doUpdate(input.Position.X)
+			end
 		end
 	end)
 
-	track.InputBegan:Connect(function(i)
-		if i.UserInputType == Enum.UserInputType.MouseButton1 or i.UserInputType == Enum.UserInputType.Touch then
-			dragging = true
-			update(i.Position.X)
-		end
-	end)
-
-	UserInputService.InputChanged:Connect(function(i)
-		if dragging and (i.UserInputType == Enum.UserInputType.MouseMovement or i.UserInputType == Enum.UserInputType.Touch) then
-			update(i.Position.X)
-		end
-	end)
-
-	UserInputService.InputEnded:Connect(function(i)
-		if i.UserInputType == Enum.UserInputType.MouseButton1 or i.UserInputType == Enum.UserInputType.Touch then
-			dragging = false
+	UserInputService.InputEnded:Connect(function(input)
+		if input.UserInputType == Enum.UserInputType.MouseButton1 then
+			thisSliderDragging = false
 		end
 	end)
 end
 
 -- TAB SWITCHING
 local function switchTab(tabName)
-	currentCategory = tabName
 	for name, page in pairs(tabPages) do page.Visible = (name == tabName) end
 	for name, btn in pairs(tabButtons) do
 		btn.BackgroundColor3 = (name == tabName) and C.tabActive or C.tabInactive
@@ -641,24 +690,18 @@ local pageFarm = mkPage("AutoFarm")
 
 local farmToggles = mkSec(pageFarm, 1)
 mkHeader(farmToggles, "AUTO MONSTER", 0)
-mkToggle(farmToggles, "⚔ Auto Monster", 1, C.txt, function(v) autoMonsterOn = v end)
-mkLbl(farmToggles, "Teleports behind each monster, fires attack, moves to next.", 2)
+mkToggle(farmToggles, "⚔ Auto Monster", 1, C.txt, function(v)
+	autoMonsterOn = v
+	-- Turn on/off auto attack on server
+	fireAutoAttack(v)
+end)
+mkLbl(farmToggles, "Teleports behind monsters, fires touch attack, auto attack on.", 2)
 
--- Speed sliders
 local speedSec = mkSec(pageFarm, 2)
 mkHeader(speedSec, "ADJUSTMENTS", 0)
+mkSlider(speedSec, "⏱ Teleport Speed", 1, 0.1, 3.0, 0.5, false, "s", function(v) farmSpeed = v end)
+mkSlider(speedSec, "🗡 Touch Hits", 2, 1, 20, 5, true, "x", function(v) touchHits = v end)
 
-mkSlider(speedSec, "⏱ Teleport Speed", 1, 0.1, 3.0, 0.5, false, "s", function(val)
-	farmSpeed = val
-end)
-
-mkSlider(speedSec, "🗡 Touch Hits Per Monster", 2, 1, 20, 5, true, "x", function(val)
-	touchHits = val
-end)
-
-mkLbl(speedSec, "Speed: time between monsters. Hits: how many TouchInterest fires per monster.", 3)
-
--- Dropdown
 local farmSelect = mkSec(pageFarm, 3)
 mkHeader(farmSelect, "SELECT MONSTER LEVEL", 0)
 
@@ -718,7 +761,7 @@ local function populateDropdown()
 		local item = Instance.new("TextButton")
 		item.Size = UDim2.new(1, 0, 0, 26)
 		item.BackgroundColor3 = (selectedLevel == lv) and C.acc or C.drop
-		item.Text = "    Lv." .. lv .. "    •    " .. count .. "/" .. total .. " in server"
+		item.Text = "    Lv." .. lv .. "    •    " .. count .. "/" .. total
 		item.TextColor3 = (selectedLevel == lv) and C.txt or C.dim
 		item.TextSize = 12
 		item.Font = Enum.Font.Gotham
@@ -745,7 +788,6 @@ end
 mkButton(farmSelect, "🔄 Refresh List", 3, C.acc, populateDropdown)
 task.delay(1, populateDropdown)
 
--- Status
 local farmStatus = mkSec(pageFarm, 4)
 mkHeader(farmStatus, "STATUS", 0)
 local lblLevel = mkLbl(farmStatus, "Level: ---", 1)
@@ -781,7 +823,6 @@ end)
 mkButton(serverSec, "🌐 Join Lowest Population Server", 2, Color3.fromRGB(40, 140, 200), function()
 	serverHopLowest()
 end)
-mkLbl(serverSec, "Finds server with fewest players via API", 3)
 
 local rejoinSec = mkSec(pageSettings, 2)
 mkHeader(rejoinSec, "AUTO REJOIN", 0)
@@ -792,8 +833,7 @@ local lblRejoin = mkLbl(rejoinSec, "Status: Off", 3)
 local infoSec = mkSec(pageSettings, 3)
 mkHeader(infoSec, "INFO", 0)
 mkLbl(infoSec, "Minimize: RightCtrl", 1)
-mkLbl(infoSec, "🚌 BUS HUB v5.1", 2)
-mkLbl(infoSec, "Players: " .. #Players:GetPlayers() .. "/" .. Players.MaxPlayers, 3)
+mkLbl(infoSec, "🚌 BUS HUB v5.2", 2)
 
 -- ========================
 -- DRAG
@@ -931,7 +971,7 @@ task.spawn(function()
 			lblIndex.Text = "Queue: " .. currentIndex .. "/" .. #monsterList
 			lblFarm.Text = "Auto Monster: Hitting"
 
-			-- Fire TouchInterest (touchHits) times on this monster
+			-- Fire touch (touchHits) times
 			for i = 1, touchHits do
 				if not autoMonsterOn then break end
 				if not target or not target.Parent then break end
@@ -945,9 +985,8 @@ task.spawn(function()
 				task.wait(0.05)
 			end
 
-			-- Wait user-defined speed before next monster
+			-- Wait user speed before next monster
 			task.wait(farmSpeed)
-
 		else
 			monsterList = {}
 			currentIndex = 0
