@@ -1,5 +1,5 @@
 -- LocalScript: Place inside StarterPlayerScripts or StarterGui
--- BUS HUB v6.0 - Clean rewrite, everything tested
+-- BUS HUB v6.2
 
 local Players = game:GetService("Players")
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
@@ -27,8 +27,9 @@ local autoPetOn = false
 local autoRejoinOn = false
 local minimized = false
 local selectedLevel = nil
-local farmSpeed = 0.5
+local farmSpeed = 1.0
 local touchHits = 5
+local autoAttackFired = false
 
 -- ========================
 -- MONSTER MAP
@@ -118,9 +119,7 @@ local function buildMonsterList(level)
 	if not folder then return {} end
 	local list = {}
 	for _, c in ipairs(folder:GetChildren()) do
-		if MONSTER_TO_LEVEL[c.Name:lower()] == level then
-			table.insert(list, c)
-		end
+		if MONSTER_TO_LEVEL[c.Name:lower()] == level then table.insert(list, c) end
 	end
 	table.sort(list, function(a, b) return a.Name < b.Name end)
 	return list
@@ -145,120 +144,79 @@ end
 
 local function getLevel()
 	local ls = Player:FindFirstChild("leaderstats")
-	if ls then
-		local lv = ls:FindFirstChild("Level")
-		if lv then return lv.Value end
-	end
+	if ls then local lv = ls:FindFirstChild("Level") if lv then return lv.Value end end
 	return 1
 end
 
 -- ========================
--- AUTO ATTACK - fires Setting/ChangeSetting
+-- AUTO ATTACK REMOTE
 -- ========================
-local function fireAutoAttack(enabled)
-	-- Try every method
-	pcall(function()
-		ReplicatedStorage["Setting/ChangeSetting"]:FireServer("AutoAttack", enabled)
-	end)
-	pcall(function()
-		ReplicatedStorage.Setting.ChangeSetting:FireServer("AutoAttack", enabled)
-	end)
-	pcall(function()
-		for _, child in ipairs(ReplicatedStorage:GetChildren()) do
-			if child.Name == "Setting/ChangeSetting" then
-				child:FireServer("AutoAttack", enabled)
-				return
-			end
-		end
-	end)
-	pcall(function()
-		for _, desc in ipairs(ReplicatedStorage:GetDescendants()) do
-			if desc.Name == "ChangeSetting" then
-				desc:FireServer("AutoAttack", enabled)
-				return
-			end
-		end
-	end)
+local function fireAutoAttackOn()
+	local args = {[1] = "AutoAttack", [2] = true}
+	local remote = ReplicatedStorage:FindFirstChild("Setting/ChangeSetting")
+	if remote then remote:FireServer(unpack(args)) return end
+	pcall(function() ReplicatedStorage["Setting/ChangeSetting"]:FireServer(unpack(args)) end)
+	pcall(function() ReplicatedStorage.Setting.ChangeSetting:FireServer(unpack(args)) end)
+end
+
+local function fireAutoAttackOff()
+	local args = {[1] = "AutoAttack", [2] = false}
+	local remote = ReplicatedStorage:FindFirstChild("Setting/ChangeSetting")
+	if remote then remote:FireServer(unpack(args)) return end
+	pcall(function() ReplicatedStorage["Setting/ChangeSetting"]:FireServer(unpack(args)) end)
+	pcall(function() ReplicatedStorage.Setting.ChangeSetting:FireServer(unpack(args)) end)
 end
 
 -- ========================
 -- PET EGG
 -- ========================
 local function firePetEggBuy()
-	pcall(function()
-		ReplicatedStorage["PetEgg/PetEggBuy"]:FireServer(30)
-	end)
-	pcall(function()
-		ReplicatedStorage.PetEgg.PetEggBuy:FireServer(30)
-	end)
-	pcall(function()
-		for _, child in ipairs(ReplicatedStorage:GetChildren()) do
-			if child.Name == "PetEgg/PetEggBuy" then
-				child:FireServer(30)
-				return
-			end
-		end
-	end)
+	local args = {[1] = 30}
+	local remote = ReplicatedStorage:FindFirstChild("PetEgg/PetEggBuy")
+	if remote then remote:FireServer(unpack(args)) return end
+	pcall(function() ReplicatedStorage["PetEgg/PetEggBuy"]:FireServer(unpack(args)) end)
 end
 
 -- ========================
--- TELEPORT TO MONSTER + ATTACK
--- Teleport behind monster at same Y, fire touch
+-- TELEPORT BEHIND + FIRE TOUCH
 -- ========================
 local function teleportAndAttack(monsterModel)
 	if not monsterModel or not monsterModel.Parent then return false end
 	if not Char or not Char.Parent then return false end
-
 	local myRoot = Char:FindFirstChild("HumanoidRootPart")
 	if not myRoot then return false end
 
-	-- Get monster position using WorldPivot
 	local monsterPos = monsterModel:GetPivot().Position
 	local monsterLook = monsterModel:GetPivot().LookVector
 
-	-- Teleport behind monster, same Y height
 	local behindPos = Vector3.new(
 		monsterPos.X - monsterLook.X * 4,
 		monsterPos.Y,
 		monsterPos.Z - monsterLook.Z * 4
 	)
-
-	-- Face toward monster
 	myRoot.CFrame = CFrame.new(behindPos, Vector3.new(monsterPos.X, behindPos.Y, monsterPos.Z))
 	myRoot.AssemblyLinearVelocity = Vector3.zero
 	myRoot.AssemblyAngularVelocity = Vector3.zero
 
-	-- Now find AttackPart and fire touch
-	-- Search inside the monster model for ANY part named AttackPart with TouchInterest
 	local attackPart = nil
-	local touchInterest = nil
-
 	for _, desc in ipairs(monsterModel:GetDescendants()) do
 		if desc.Name == "AttackPart" and desc:IsA("BasePart") then
-			local ti = desc:FindFirstChild("TouchInterest")
-			if ti then
-				attackPart = desc
-				touchInterest = ti
-				break
-			end
+			if desc:FindFirstChild("TouchInterest") then attackPart = desc break end
 		end
 	end
+	if not attackPart then return false end
 
-	if not attackPart or not touchInterest then return false end
-
-	-- Fire touch using firetouchinterest
 	if type(firetouchinterest) == "function" then
-		firetouchinterest(myRoot, attackPart, 0) -- begin
+		firetouchinterest(myRoot, attackPart, 0)
 		task.wait()
-		firetouchinterest(myRoot, attackPart, 1) -- end
+		firetouchinterest(myRoot, attackPart, 1)
 		return true
 	end
 
-	-- Fallback: physically move into the part to trigger touch
-	local savedCF = myRoot.CFrame
+	local saved = myRoot.CFrame
 	myRoot.CFrame = attackPart.CFrame
 	task.wait()
-	myRoot.CFrame = savedCF
+	myRoot.CFrame = saved
 	return true
 end
 
@@ -266,551 +224,272 @@ end
 -- SERVER HOP
 -- ========================
 local function serverHopLowest()
-	local placeId = game.PlaceId
-	local currentJobId = game.JobId
-	local lowestPlayers = math.huge
-	local lowestServerId = nil
+	local pid = game.PlaceId
+	local cjid = game.JobId
+	local low = math.huge
+	local sid = nil
 	pcall(function()
-		local url = "https://games.roblox.com/v1/games/" .. placeId .. "/servers/Public?sortOrder=Asc&limit=100"
-		local data = HttpService:JSONDecode(game:HttpGet(url))
-		if data and data.data then
-			for _, server in ipairs(data.data) do
-				if server.playing and server.id ~= currentJobId then
-					if server.playing < lowestPlayers then
-						lowestPlayers = server.playing
-						lowestServerId = server.id
-					end
-				end
-			end
-		end
+		local d = HttpService:JSONDecode(game:HttpGet("https://games.roblox.com/v1/games/"..pid.."/servers/Public?sortOrder=Asc&limit=100"))
+		if d and d.data then for _, s in ipairs(d.data) do
+			if s.playing and s.id ~= cjid and s.playing < low then low = s.playing; sid = s.id end
+		end end
 	end)
-	if lowestServerId then
-		TeleportService:TeleportToPlaceInstance(placeId, lowestServerId, Player)
-	else
-		TeleportService:Teleport(placeId, Player)
-	end
+	if sid then TeleportService:TeleportToPlaceInstance(pid, sid, Player)
+	else TeleportService:Teleport(pid, Player) end
 end
 
 -- ========================
 -- COLORS
 -- ========================
 local C = {
-	bg = Color3.fromRGB(12, 12, 20), bar = Color3.fromRGB(18, 18, 30),
-	barAccent = Color3.fromRGB(80, 50, 200), acc = Color3.fromRGB(80, 50, 200),
-	on = Color3.fromRGB(30, 170, 70), off = Color3.fromRGB(170, 30, 30),
-	txt = Color3.fromRGB(220, 220, 235), dim = Color3.fromRGB(100, 100, 125),
-	sec = Color3.fromRGB(18, 18, 28), brd = Color3.fromRGB(35, 35, 52),
-	drop = Color3.fromRGB(14, 14, 24), hover = Color3.fromRGB(30, 30, 45),
-	tabActive = Color3.fromRGB(80, 50, 200), tabInactive = Color3.fromRGB(24, 24, 38),
-	tabTxtActive = Color3.fromRGB(255, 255, 255), tabTxtInactive = Color3.fromRGB(90, 90, 115),
-	warn = Color3.fromRGB(220, 160, 40),
-	sliderTrack = Color3.fromRGB(30, 30, 45), sliderFill = Color3.fromRGB(60, 40, 160),
-	sliderKnob = Color3.fromRGB(130, 100, 255),
+	bg=Color3.fromRGB(12,12,20), bar=Color3.fromRGB(18,18,30),
+	barAccent=Color3.fromRGB(80,50,200), acc=Color3.fromRGB(80,50,200),
+	on=Color3.fromRGB(30,170,70), off=Color3.fromRGB(170,30,30),
+	txt=Color3.fromRGB(220,220,235), dim=Color3.fromRGB(100,100,125),
+	sec=Color3.fromRGB(18,18,28), brd=Color3.fromRGB(35,35,52),
+	drop=Color3.fromRGB(14,14,24), hover=Color3.fromRGB(30,30,45),
+	tabA=Color3.fromRGB(80,50,200), tabI=Color3.fromRGB(24,24,38),
+	tabTA=Color3.fromRGB(255,255,255), tabTI=Color3.fromRGB(90,90,115),
+	warn=Color3.fromRGB(220,160,40),
+	sT=Color3.fromRGB(30,30,45), sF=Color3.fromRGB(60,40,160), sK=Color3.fromRGB(130,100,255),
 }
 
 -- ========================
 -- GUI
 -- ========================
 local Gui = Instance.new("ScreenGui")
-Gui.Name = "BusHub"
-Gui.ResetOnSpawn = false
-Gui.ZIndexBehavior = Enum.ZIndexBehavior.Sibling
-Gui.Parent = Player:WaitForChild("PlayerGui")
+Gui.Name="BusHub"; Gui.ResetOnSpawn=false; Gui.ZIndexBehavior=Enum.ZIndexBehavior.Sibling
+Gui.Parent=Player:WaitForChild("PlayerGui")
 
 local Main = Instance.new("Frame")
-Main.Size = UDim2.new(0, 340, 0, 500)
-Main.Position = UDim2.new(0.5, -170, 0.5, -250)
-Main.BackgroundColor3 = C.bg
-Main.BorderSizePixel = 0
-Main.Active = true
-Main.Parent = Gui
-Instance.new("UICorner", Main).CornerRadius = UDim.new(0, 10)
-Instance.new("UIStroke", Main).Color = C.brd
+Main.Size=UDim2.new(0,340,0,500); Main.Position=UDim2.new(0.5,-170,0.5,-250)
+Main.BackgroundColor3=C.bg; Main.BorderSizePixel=0; Main.Active=true; Main.Parent=Gui
+Instance.new("UICorner",Main).CornerRadius=UDim.new(0,10)
+Instance.new("UIStroke",Main).Color=C.brd
 
 local Bar = Instance.new("Frame")
-Bar.Size = UDim2.new(1, 0, 0, 40)
-Bar.BackgroundColor3 = C.bar
-Bar.BorderSizePixel = 0
-Bar.Parent = Main
-Instance.new("UICorner", Bar).CornerRadius = UDim.new(0, 10)
+Bar.Size=UDim2.new(1,0,0,40); Bar.BackgroundColor3=C.bar; Bar.BorderSizePixel=0; Bar.Parent=Main
+Instance.new("UICorner",Bar).CornerRadius=UDim.new(0,10)
+local bf=Instance.new("Frame"); bf.Size=UDim2.new(1,0,0,12); bf.Position=UDim2.new(0,0,1,-12); bf.BackgroundColor3=C.bar; bf.BorderSizePixel=0; bf.Parent=Bar
+local al=Instance.new("Frame"); al.Size=UDim2.new(1,-20,0,2); al.Position=UDim2.new(0,10,1,-1); al.BackgroundColor3=C.barAccent; al.BorderSizePixel=0; al.Parent=Bar
+local lg=Instance.new("TextLabel"); lg.Size=UDim2.new(0,160,1,0); lg.Position=UDim2.new(0,14,0,0); lg.BackgroundTransparency=1; lg.Text="🚌 BUS HUB v6.2"; lg.TextColor3=C.txt; lg.TextSize=15; lg.Font=Enum.Font.GothamBold; lg.TextXAlignment=Enum.TextXAlignment.Left; lg.Parent=Bar
+local MinBtn=Instance.new("TextButton"); MinBtn.Size=UDim2.new(0,28,0,28); MinBtn.Position=UDim2.new(1,-38,0,6); MinBtn.BackgroundColor3=C.acc; MinBtn.Text="—"; MinBtn.TextColor3=C.txt; MinBtn.TextSize=16; MinBtn.Font=Enum.Font.GothamBold; MinBtn.BorderSizePixel=0; MinBtn.Parent=Bar; Instance.new("UICorner",MinBtn).CornerRadius=UDim.new(0,6)
 
-local barCover = Instance.new("Frame")
-barCover.Size = UDim2.new(1, 0, 0, 12)
-barCover.Position = UDim2.new(0, 0, 1, -12)
-barCover.BackgroundColor3 = C.bar
-barCover.BorderSizePixel = 0
-barCover.Parent = Bar
-
-local aLine = Instance.new("Frame")
-aLine.Size = UDim2.new(1, -20, 0, 2)
-aLine.Position = UDim2.new(0, 10, 1, -1)
-aLine.BackgroundColor3 = C.barAccent
-aLine.BorderSizePixel = 0
-aLine.Parent = Bar
-
-local LogoLbl = Instance.new("TextLabel")
-LogoLbl.Size = UDim2.new(0, 160, 1, 0)
-LogoLbl.Position = UDim2.new(0, 14, 0, 0)
-LogoLbl.BackgroundTransparency = 1
-LogoLbl.Text = "🚌 BUS HUB v6.0"
-LogoLbl.TextColor3 = C.txt
-LogoLbl.TextSize = 15
-LogoLbl.Font = Enum.Font.GothamBold
-LogoLbl.TextXAlignment = Enum.TextXAlignment.Left
-LogoLbl.Parent = Bar
-
-local MinBtn = Instance.new("TextButton")
-MinBtn.Size = UDim2.new(0, 28, 0, 28)
-MinBtn.Position = UDim2.new(1, -38, 0, 6)
-MinBtn.BackgroundColor3 = C.acc
-MinBtn.Text = "—"
-MinBtn.TextColor3 = C.txt
-MinBtn.TextSize = 16
-MinBtn.Font = Enum.Font.GothamBold
-MinBtn.BorderSizePixel = 0
-MinBtn.Parent = Bar
-Instance.new("UICorner", MinBtn).CornerRadius = UDim.new(0, 6)
-
-local TabBar = Instance.new("Frame")
-TabBar.Size = UDim2.new(1, -20, 0, 30)
-TabBar.Position = UDim2.new(0, 10, 0, 44)
-TabBar.BackgroundTransparency = 1
-TabBar.Parent = Main
-local tl = Instance.new("UIListLayout", TabBar)
-tl.FillDirection = Enum.FillDirection.Horizontal
-tl.Padding = UDim.new(0, 4)
-tl.SortOrder = Enum.SortOrder.LayoutOrder
-
-local tabButtons = {}
-local tabPages = {}
-
-for i, info in ipairs({{"AutoFarm","⚔ Monster"},{"AutoEgg","🥚 Egg"},{"Settings","⚙ Settings"}}) do
-	local b = Instance.new("TextButton")
-	b.Size = UDim2.new(0, 100, 1, 0)
-	b.BackgroundColor3 = i == 1 and C.tabActive or C.tabInactive
-	b.Text = info[2]
-	b.TextColor3 = i == 1 and C.tabTxtActive or C.tabTxtInactive
-	b.TextSize = 11
-	b.Font = Enum.Font.GothamBold
-	b.BorderSizePixel = 0
-	b.LayoutOrder = i
-	b.Parent = TabBar
-	Instance.new("UICorner", b).CornerRadius = UDim.new(0, 6)
-	tabButtons[info[1]] = b
+local TB=Instance.new("Frame"); TB.Size=UDim2.new(1,-20,0,30); TB.Position=UDim2.new(0,10,0,44); TB.BackgroundTransparency=1; TB.Parent=Main
+local tbl=Instance.new("UIListLayout",TB); tbl.FillDirection=Enum.FillDirection.Horizontal; tbl.Padding=UDim.new(0,4); tbl.SortOrder=Enum.SortOrder.LayoutOrder
+local tabButtons={}; local tabPages={}
+for i,info in ipairs({{"AutoFarm","⚔ Monster"},{"AutoEgg","🥚 Egg"},{"Settings","⚙ Settings"}}) do
+	local b=Instance.new("TextButton"); b.Size=UDim2.new(0,100,1,0); b.BackgroundColor3=i==1 and C.tabA or C.tabI; b.Text=info[2]; b.TextColor3=i==1 and C.tabTA or C.tabTI; b.TextSize=11; b.Font=Enum.Font.GothamBold; b.BorderSizePixel=0; b.LayoutOrder=i; b.Parent=TB; Instance.new("UICorner",b).CornerRadius=UDim.new(0,6); tabButtons[info[1]]=b
 end
 
-local ContentArea = Instance.new("Frame")
-ContentArea.Size = UDim2.new(1, -20, 1, -84)
-ContentArea.Position = UDim2.new(0, 10, 0, 78)
-ContentArea.BackgroundTransparency = 1
-ContentArea.ClipsDescendants = true
-ContentArea.Parent = Main
+local CA=Instance.new("Frame"); CA.Size=UDim2.new(1,-20,1,-84); CA.Position=UDim2.new(0,10,0,78); CA.BackgroundTransparency=1; CA.ClipsDescendants=true; CA.Parent=Main
 
--- UI HELPERS
-local function mkPage(name)
-	local p = Instance.new("ScrollingFrame")
-	p.Size = UDim2.new(1, 0, 1, 0)
-	p.BackgroundTransparency = 1
-	p.ScrollBarThickness = 3
-	p.ScrollBarImageColor3 = C.acc
-	p.AutomaticCanvasSize = Enum.AutomaticSize.Y
-	p.CanvasSize = UDim2.new(0, 0, 0, 0)
-	p.BorderSizePixel = 0
-	p.Visible = (name == "AutoFarm")
-	p.Name = name
-	p.Parent = ContentArea
-	local ll = Instance.new("UIListLayout", p)
-	ll.Padding = UDim.new(0, 8)
-	ll.SortOrder = Enum.SortOrder.LayoutOrder
-	tabPages[name] = p
-	return p
-end
-
-local function mkSec(parent, order)
-	local f = Instance.new("Frame")
-	f.Size = UDim2.new(1, 0, 0, 0)
-	f.AutomaticSize = Enum.AutomaticSize.Y
-	f.BackgroundColor3 = C.sec
-	f.BorderSizePixel = 0
-	f.LayoutOrder = order
-	f.Parent = parent
-	Instance.new("UICorner", f).CornerRadius = UDim.new(0, 8)
-	Instance.new("UIStroke", f).Color = C.brd
-	local pd = Instance.new("UIPadding", f)
-	pd.PaddingTop = UDim.new(0, 8)
-	pd.PaddingBottom = UDim.new(0, 8)
-	pd.PaddingLeft = UDim.new(0, 10)
-	pd.PaddingRight = UDim.new(0, 10)
-	local ll = Instance.new("UIListLayout", f)
-	ll.Padding = UDim.new(0, 5)
-	ll.SortOrder = Enum.SortOrder.LayoutOrder
-	return f
-end
-
-local function mkH(p,t,o) local l=Instance.new("TextLabel") l.Size=UDim2.new(1,0,0,16) l.BackgroundTransparency=1 l.Text=t l.TextColor3=C.acc l.TextSize=11 l.Font=Enum.Font.GothamBold l.TextXAlignment=Enum.TextXAlignment.Left l.LayoutOrder=o l.Parent=p end
-local function mkL(p,t,o) local l=Instance.new("TextLabel") l.Size=UDim2.new(1,0,0,16) l.AutomaticSize=Enum.AutomaticSize.Y l.BackgroundTransparency=1 l.Text=t l.TextColor3=C.dim l.TextSize=12 l.Font=Enum.Font.Gotham l.TextXAlignment=Enum.TextXAlignment.Left l.TextWrapped=true l.LayoutOrder=o l.Parent=p return l end
-
-local function mkT(p,n,o,lc,cb)
-	local r=Instance.new("Frame") r.Size=UDim2.new(1,0,0,30) r.BackgroundTransparency=1 r.LayoutOrder=o r.Parent=p
-	local l=Instance.new("TextLabel") l.Size=UDim2.new(1,-58,1,0) l.BackgroundTransparency=1 l.Text=n l.TextColor3=lc or C.txt l.TextSize=13 l.Font=Enum.Font.GothamMedium l.TextXAlignment=Enum.TextXAlignment.Left l.Parent=r
-	local b=Instance.new("TextButton") b.Size=UDim2.new(0,52,0,24) b.Position=UDim2.new(1,-52,0.5,-12) b.BackgroundColor3=C.off b.Text="OFF" b.TextColor3=Color3.new(1,1,1) b.TextSize=11 b.Font=Enum.Font.GothamBold b.BorderSizePixel=0 b.Parent=r
-	Instance.new("UICorner",b).CornerRadius=UDim.new(0,6)
-	local on=false
-	b.MouseButton1Click:Connect(function() on=not on b.BackgroundColor3=on and C.on or C.off b.Text=on and "ON" or "OFF" cb(on) end)
-end
-
-local function mkB(p,n,o,c,cb)
-	local b=Instance.new("TextButton") b.Size=UDim2.new(1,0,0,30) b.BackgroundColor3=c or C.acc b.Text=n b.TextColor3=Color3.new(1,1,1) b.TextSize=12 b.Font=Enum.Font.GothamBold b.BorderSizePixel=0 b.LayoutOrder=o b.Parent=p
-	Instance.new("UICorner",b).CornerRadius=UDim.new(0,6)
-	b.MouseButton1Click:Connect(function() if cb then cb() end end)
-end
+-- HELPERS
+local function mkP(n) local p=Instance.new("ScrollingFrame"); p.Size=UDim2.new(1,0,1,0); p.BackgroundTransparency=1; p.ScrollBarThickness=3; p.ScrollBarImageColor3=C.acc; p.AutomaticCanvasSize=Enum.AutomaticSize.Y; p.CanvasSize=UDim2.new(0,0,0,0); p.BorderSizePixel=0; p.Visible=(n=="AutoFarm"); p.Name=n; p.Parent=CA; local l=Instance.new("UIListLayout",p); l.Padding=UDim.new(0,8); l.SortOrder=Enum.SortOrder.LayoutOrder; tabPages[n]=p; return p end
+local function mkSc(p,o) local f=Instance.new("Frame"); f.Size=UDim2.new(1,0,0,0); f.AutomaticSize=Enum.AutomaticSize.Y; f.BackgroundColor3=C.sec; f.BorderSizePixel=0; f.LayoutOrder=o; f.Parent=p; Instance.new("UICorner",f).CornerRadius=UDim.new(0,8); Instance.new("UIStroke",f).Color=C.brd; local pd=Instance.new("UIPadding",f); pd.PaddingTop=UDim.new(0,8); pd.PaddingBottom=UDim.new(0,8); pd.PaddingLeft=UDim.new(0,10); pd.PaddingRight=UDim.new(0,10); local l=Instance.new("UIListLayout",f); l.Padding=UDim.new(0,5); l.SortOrder=Enum.SortOrder.LayoutOrder; return f end
+local function mkH(p,t,o) local l=Instance.new("TextLabel"); l.Size=UDim2.new(1,0,0,16); l.BackgroundTransparency=1; l.Text=t; l.TextColor3=C.acc; l.TextSize=11; l.Font=Enum.Font.GothamBold; l.TextXAlignment=Enum.TextXAlignment.Left; l.LayoutOrder=o; l.Parent=p end
+local function mkL(p,t,o) local l=Instance.new("TextLabel"); l.Size=UDim2.new(1,0,0,16); l.AutomaticSize=Enum.AutomaticSize.Y; l.BackgroundTransparency=1; l.Text=t; l.TextColor3=C.dim; l.TextSize=12; l.Font=Enum.Font.Gotham; l.TextXAlignment=Enum.TextXAlignment.Left; l.TextWrapped=true; l.LayoutOrder=o; l.Parent=p; return l end
+local function mkT(p,n,o,lc,cb) local r=Instance.new("Frame"); r.Size=UDim2.new(1,0,0,30); r.BackgroundTransparency=1; r.LayoutOrder=o; r.Parent=p; local l=Instance.new("TextLabel"); l.Size=UDim2.new(1,-58,1,0); l.BackgroundTransparency=1; l.Text=n; l.TextColor3=lc or C.txt; l.TextSize=13; l.Font=Enum.Font.GothamMedium; l.TextXAlignment=Enum.TextXAlignment.Left; l.Parent=r; local b=Instance.new("TextButton"); b.Size=UDim2.new(0,52,0,24); b.Position=UDim2.new(1,-52,0.5,-12); b.BackgroundColor3=C.off; b.Text="OFF"; b.TextColor3=Color3.new(1,1,1); b.TextSize=11; b.Font=Enum.Font.GothamBold; b.BorderSizePixel=0; b.Parent=r; Instance.new("UICorner",b).CornerRadius=UDim.new(0,6); local on=false; b.MouseButton1Click:Connect(function() on=not on; b.BackgroundColor3=on and C.on or C.off; b.Text=on and "ON" or "OFF"; cb(on) end) end
+local function mkB(p,n,o,c,cb) local b=Instance.new("TextButton"); b.Size=UDim2.new(1,0,0,30); b.BackgroundColor3=c or C.acc; b.Text=n; b.TextColor3=Color3.new(1,1,1); b.TextSize=12; b.Font=Enum.Font.GothamBold; b.BorderSizePixel=0; b.LayoutOrder=o; b.Parent=p; Instance.new("UICorner",b).CornerRadius=UDim.new(0,6); b.MouseButton1Click:Connect(function() if cb then cb() end end) end
 
 local function mkS(p,n,o,mn,mx,df,isI,sf,cb)
-	local ct=Instance.new("Frame") ct.Size=UDim2.new(1,0,0,46) ct.BackgroundTransparency=1 ct.LayoutOrder=o ct.Parent=p
-	local nl=Instance.new("TextLabel") nl.Size=UDim2.new(0.65,0,0,16) nl.BackgroundTransparency=1 nl.Text=n nl.TextColor3=C.txt nl.TextSize=12 nl.Font=Enum.Font.GothamMedium nl.TextXAlignment=Enum.TextXAlignment.Left nl.Parent=ct
+	local ct=Instance.new("Frame"); ct.Size=UDim2.new(1,0,0,46); ct.BackgroundTransparency=1; ct.LayoutOrder=o; ct.Parent=p
+	local nl=Instance.new("TextLabel"); nl.Size=UDim2.new(0.65,0,0,16); nl.BackgroundTransparency=1; nl.Text=n; nl.TextColor3=C.txt; nl.TextSize=12; nl.Font=Enum.Font.GothamMedium; nl.TextXAlignment=Enum.TextXAlignment.Left; nl.Parent=ct
 	local function fmt(v) if isI then return tostring(math.floor(v+0.5))..sf else return string.format("%.1f",v)..sf end end
-	local vl=Instance.new("TextLabel") vl.Size=UDim2.new(0.35,0,0,16) vl.Position=UDim2.new(0.65,0,0,0) vl.BackgroundTransparency=1 vl.Text=fmt(df) vl.TextColor3=C.sliderKnob vl.TextSize=12 vl.Font=Enum.Font.GothamBold vl.TextXAlignment=Enum.TextXAlignment.Right vl.Parent=ct
-	local tk=Instance.new("TextButton") tk.Size=UDim2.new(1,0,0,14) tk.Position=UDim2.new(0,0,0,22) tk.BackgroundColor3=C.sliderTrack tk.BorderSizePixel=0 tk.Text="" tk.AutoButtonColor=false tk.Parent=ct
-	Instance.new("UICorner",tk).CornerRadius=UDim.new(1,0)
+	local vl=Instance.new("TextLabel"); vl.Size=UDim2.new(0.35,0,0,16); vl.Position=UDim2.new(0.65,0,0,0); vl.BackgroundTransparency=1; vl.Text=fmt(df); vl.TextColor3=C.sK; vl.TextSize=12; vl.Font=Enum.Font.GothamBold; vl.TextXAlignment=Enum.TextXAlignment.Right; vl.Parent=ct
+	local tk=Instance.new("TextButton"); tk.Size=UDim2.new(1,0,0,14); tk.Position=UDim2.new(0,0,0,22); tk.BackgroundColor3=C.sT; tk.BorderSizePixel=0; tk.Text=""; tk.AutoButtonColor=false; tk.Parent=ct; Instance.new("UICorner",tk).CornerRadius=UDim.new(1,0)
 	local sp=math.clamp((df-mn)/(mx-mn),0,1)
-	local fl=Instance.new("Frame") fl.Size=UDim2.new(sp,0,1,0) fl.BackgroundColor3=C.sliderFill fl.BorderSizePixel=0 fl.Parent=tk
-	Instance.new("UICorner",fl).CornerRadius=UDim.new(1,0)
-	local kb=Instance.new("Frame") kb.Size=UDim2.new(0,16,0,16) kb.Position=UDim2.new(sp,-8,0.5,-8) kb.BackgroundColor3=C.sliderKnob kb.BorderSizePixel=0 kb.ZIndex=5 kb.Parent=tk
-	Instance.new("UICorner",kb).CornerRadius=UDim.new(1,0)
+	local fl=Instance.new("Frame"); fl.Size=UDim2.new(sp,0,1,0); fl.BackgroundColor3=C.sF; fl.BorderSizePixel=0; fl.Parent=tk; Instance.new("UICorner",fl).CornerRadius=UDim.new(1,0)
+	local kb=Instance.new("Frame"); kb.Size=UDim2.new(0,16,0,16); kb.Position=UDim2.new(sp,-8,0.5,-8); kb.BackgroundColor3=C.sK; kb.BorderSizePixel=0; kb.ZIndex=5; kb.Parent=tk; Instance.new("UICorner",kb).CornerRadius=UDim.new(1,0)
 	local dr=false
-	local function upd(ix)
-		local tp=tk.AbsolutePosition.X local ts=tk.AbsoluteSize.X
-		if ts==0 then return end
-		local rl=math.clamp((ix-tp)/ts,0,1)
-		fl.Size=UDim2.new(rl,0,1,0) kb.Position=UDim2.new(rl,-8,0.5,-8)
-		local v=mn+(mx-mn)*rl
-		if isI then v=math.floor(v+0.5) else v=math.floor(v*10)/10 end
-		v=math.clamp(v,mn,mx) vl.Text=fmt(v) if cb then cb(v) end
-	end
-	tk.MouseButton1Down:Connect(function(x) dr=true upd(x) end)
+	local function upd(ix) local tp=tk.AbsolutePosition.X; local ts=tk.AbsoluteSize.X; if ts==0 then return end; local rl=math.clamp((ix-tp)/ts,0,1); fl.Size=UDim2.new(rl,0,1,0); kb.Position=UDim2.new(rl,-8,0.5,-8); local v=mn+(mx-mn)*rl; if isI then v=math.floor(v+0.5) else v=math.floor(v*10)/10 end; v=math.clamp(v,mn,mx); vl.Text=fmt(v); if cb then cb(v) end end
+	tk.MouseButton1Down:Connect(function(x) dr=true; upd(x) end)
 	UserInputService.InputChanged:Connect(function(i) if dr and i.UserInputType==Enum.UserInputType.MouseMovement then upd(i.Position.X) end end)
 	UserInputService.InputEnded:Connect(function(i) if i.UserInputType==Enum.UserInputType.MouseButton1 then dr=false end end)
 end
 
--- TAB SWITCH
-local function switchTab(tn)
-	for n,pg in pairs(tabPages) do pg.Visible=(n==tn) end
-	for n,bt in pairs(tabButtons) do bt.BackgroundColor3=(n==tn) and C.tabActive or C.tabInactive bt.TextColor3=(n==tn) and C.tabTxtActive or C.tabTxtInactive end
-end
+local function switchTab(tn) for n,pg in pairs(tabPages) do pg.Visible=(n==tn) end; for n,bt in pairs(tabButtons) do bt.BackgroundColor3=(n==tn) and C.tabA or C.tabI; bt.TextColor3=(n==tn) and C.tabTA or C.tabTI end end
 for n,bt in pairs(tabButtons) do bt.MouseButton1Click:Connect(function() switchTab(n) end) end
 
 -- ========================
 -- PAGE 1: AUTO MONSTER
 -- ========================
-local p1 = mkPage("AutoFarm")
-local s1 = mkSec(p1, 1)
-mkH(s1, "AUTO MONSTER", 0)
-mkT(s1, "⚔ Auto Monster", 1, C.txt, function(v)
-	autoMonsterOn = v
-	fireAutoAttack(v)
-end)
+local p1=mkP("AutoFarm")
+local s1=mkSc(p1,1); mkH(s1,"AUTO MONSTER",0)
+mkT(s1,"⚔ Auto Monster",1,C.txt,function(v) autoMonsterOn=v end)
 
-local s2 = mkSec(p1, 2)
-mkH(s2, "ADJUSTMENTS", 0)
-mkS(s2, "⏱ Teleport Speed", 1, 0.1, 3.0, 0.5, false, "s", function(v) farmSpeed = v end)
-mkS(s2, "🗡 Touch Hits", 2, 1, 20, 5, true, "x", function(v) touchHits = v end)
+local s2=mkSc(p1,2); mkH(s2,"ADJUSTMENTS",0)
+mkS(s2,"⏱ Teleport Speed",1, 0.1, 10.0, 1.0, false,"s",function(v) farmSpeed=v end)
+mkS(s2,"🗡 Touch Hits",2, 1, 20, 5, true,"x",function(v) touchHits=v end)
 
-local s3 = mkSec(p1, 3)
-mkH(s3, "SELECT MONSTER LEVEL", 0)
+local s3=mkSc(p1,3); mkH(s3,"SELECT MONSTER LEVEL",0)
+local dropBtn=Instance.new("TextButton"); dropBtn.Size=UDim2.new(1,0,0,30); dropBtn.BackgroundColor3=C.drop; dropBtn.Text="▼  Select Level..."; dropBtn.TextColor3=C.txt; dropBtn.TextSize=12; dropBtn.Font=Enum.Font.GothamMedium; dropBtn.TextXAlignment=Enum.TextXAlignment.Left; dropBtn.BorderSizePixel=0; dropBtn.LayoutOrder=1; dropBtn.Parent=s3; Instance.new("UICorner",dropBtn).CornerRadius=UDim.new(0,6); Instance.new("UIStroke",dropBtn).Color=C.brd; Instance.new("UIPadding",dropBtn).PaddingLeft=UDim.new(0,12)
+local dropList=Instance.new("Frame"); dropList.Size=UDim2.new(1,0,0,0); dropList.AutomaticSize=Enum.AutomaticSize.Y; dropList.BackgroundColor3=C.drop; dropList.BorderSizePixel=0; dropList.LayoutOrder=2; dropList.Visible=false; dropList.ClipsDescendants=true; dropList.Parent=s3; Instance.new("UICorner",dropList).CornerRadius=UDim.new(0,6); Instance.new("UIStroke",dropList).Color=C.brd
+local dropScroll=Instance.new("ScrollingFrame"); dropScroll.Size=UDim2.new(1,0,0,160); dropScroll.BackgroundTransparency=1; dropScroll.ScrollBarThickness=3; dropScroll.ScrollBarImageColor3=C.acc; dropScroll.AutomaticCanvasSize=Enum.AutomaticSize.Y; dropScroll.CanvasSize=UDim2.new(0,0,0,0); dropScroll.BorderSizePixel=0; dropScroll.Parent=dropList; local dll=Instance.new("UIListLayout",dropScroll); dll.Padding=UDim.new(0,1); dll.SortOrder=Enum.SortOrder.LayoutOrder
+local dropOpen=false; dropBtn.MouseButton1Click:Connect(function() dropOpen=not dropOpen; dropList.Visible=dropOpen end)
 
-local dropBtn = Instance.new("TextButton")
-dropBtn.Size = UDim2.new(1, 0, 0, 30)
-dropBtn.BackgroundColor3 = C.drop
-dropBtn.Text = "▼  Select Level..."
-dropBtn.TextColor3 = C.txt
-dropBtn.TextSize = 12
-dropBtn.Font = Enum.Font.GothamMedium
-dropBtn.TextXAlignment = Enum.TextXAlignment.Left
-dropBtn.BorderSizePixel = 0
-dropBtn.LayoutOrder = 1
-dropBtn.Parent = s3
-Instance.new("UICorner", dropBtn).CornerRadius = UDim.new(0, 6)
-Instance.new("UIStroke", dropBtn).Color = C.brd
-Instance.new("UIPadding", dropBtn).PaddingLeft = UDim.new(0, 12)
-
-local dropList = Instance.new("Frame")
-dropList.Size = UDim2.new(1, 0, 0, 0)
-dropList.AutomaticSize = Enum.AutomaticSize.Y
-dropList.BackgroundColor3 = C.drop
-dropList.BorderSizePixel = 0
-dropList.LayoutOrder = 2
-dropList.Visible = false
-dropList.ClipsDescendants = true
-dropList.Parent = s3
-Instance.new("UICorner", dropList).CornerRadius = UDim.new(0, 6)
-Instance.new("UIStroke", dropList).Color = C.brd
-
-local dropScroll = Instance.new("ScrollingFrame")
-dropScroll.Size = UDim2.new(1, 0, 0, 160)
-dropScroll.BackgroundTransparency = 1
-dropScroll.ScrollBarThickness = 3
-dropScroll.ScrollBarImageColor3 = C.acc
-dropScroll.AutomaticCanvasSize = Enum.AutomaticSize.Y
-dropScroll.CanvasSize = UDim2.new(0, 0, 0, 0)
-dropScroll.BorderSizePixel = 0
-dropScroll.Parent = dropList
-local dll = Instance.new("UIListLayout", dropScroll)
-dll.Padding = UDim.new(0, 1)
-dll.SortOrder = Enum.SortOrder.LayoutOrder
-
-local dropOpen = false
-dropBtn.MouseButton1Click:Connect(function() dropOpen = not dropOpen; dropList.Visible = dropOpen end)
-
-local function populateDropdown()
-	for _, ch in ipairs(dropScroll:GetChildren()) do if ch:IsA("TextButton") then ch:Destroy() end end
-	for i, lv in ipairs(getAllLevels()) do
-		local cnt = countMonstersForLevel(lv)
-		local tot = LEVEL_MONSTERS[lv] and #LEVEL_MONSTERS[lv] or 0
-		local it = Instance.new("TextButton")
-		it.Size = UDim2.new(1, 0, 0, 26)
-		it.BackgroundColor3 = (selectedLevel == lv) and C.acc or C.drop
-		it.Text = "    Lv." .. lv .. "  •  " .. cnt .. "/" .. tot
-		it.TextColor3 = (selectedLevel == lv) and C.txt or C.dim
-		it.TextSize = 12
-		it.Font = Enum.Font.Gotham
-		it.TextXAlignment = Enum.TextXAlignment.Left
-		it.BorderSizePixel = 0
-		it.LayoutOrder = i
-		it.Parent = dropScroll
-		it.MouseEnter:Connect(function() it.BackgroundColor3 = C.hover; it.TextColor3 = C.txt end)
-		it.MouseLeave:Connect(function()
-			it.BackgroundColor3 = (selectedLevel == lv) and C.acc or C.drop
-			it.TextColor3 = (selectedLevel == lv) and C.txt or C.dim
-		end)
-		it.MouseButton1Click:Connect(function()
-			selectedLevel = lv
-			dropBtn.Text = "▼  Level " .. lv .. "  •  " .. cnt .. " monsters"
-			dropOpen = false; dropList.Visible = false
-			for _, bb in ipairs(dropScroll:GetChildren()) do
-				if bb:IsA("TextButton") then bb.BackgroundColor3 = C.drop; bb.TextColor3 = C.dim end
-			end
-			it.BackgroundColor3 = C.acc; it.TextColor3 = C.txt
-		end)
+local function popDrop()
+	for _,ch in ipairs(dropScroll:GetChildren()) do if ch:IsA("TextButton") then ch:Destroy() end end
+	for i,lv in ipairs(getAllLevels()) do
+		local cnt=countMonstersForLevel(lv); local tot=LEVEL_MONSTERS[lv] and #LEVEL_MONSTERS[lv] or 0
+		local it=Instance.new("TextButton"); it.Size=UDim2.new(1,0,0,26); it.BackgroundColor3=(selectedLevel==lv) and C.acc or C.drop; it.Text="    Lv."..lv.."  •  "..cnt.."/"..tot; it.TextColor3=(selectedLevel==lv) and C.txt or C.dim; it.TextSize=12; it.Font=Enum.Font.Gotham; it.TextXAlignment=Enum.TextXAlignment.Left; it.BorderSizePixel=0; it.LayoutOrder=i; it.Parent=dropScroll
+		it.MouseEnter:Connect(function() it.BackgroundColor3=C.hover; it.TextColor3=C.txt end)
+		it.MouseLeave:Connect(function() it.BackgroundColor3=(selectedLevel==lv) and C.acc or C.drop; it.TextColor3=(selectedLevel==lv) and C.txt or C.dim end)
+		it.MouseButton1Click:Connect(function() selectedLevel=lv; dropBtn.Text="▼  Level "..lv.."  •  "..cnt.." monsters"; dropOpen=false; dropList.Visible=false; for _,bb in ipairs(dropScroll:GetChildren()) do if bb:IsA("TextButton") then bb.BackgroundColor3=C.drop; bb.TextColor3=C.dim end end; it.BackgroundColor3=C.acc; it.TextColor3=C.txt end)
 	end
 end
-mkB(s3, "🔄 Refresh List", 3, C.acc, populateDropdown)
-task.delay(1, populateDropdown)
+mkB(s3,"🔄 Refresh List",3,C.acc,popDrop); task.delay(1,popDrop)
 
-local s4 = mkSec(p1, 4)
-mkH(s4, "STATUS", 0)
-local lblLevel = mkL(s4, "Level: ---", 1)
-local lblTarget = mkL(s4, "Target: None", 2)
-local lblFarm = mkL(s4, "Auto Monster: Off", 3)
-local lblCount = mkL(s4, "Monsters: 0", 4)
-local lblIndex = mkL(s4, "Queue: 0/0", 5)
-local lblHits = mkL(s4, "Hits: 0", 6)
-local lblSpeed = mkL(s4, "Speed: 0.5s | Touch: 5x", 7)
-local lblDebug = mkL(s4, "Debug: ---", 8)
+local s4=mkSc(p1,4); mkH(s4,"STATUS",0)
+local lblLevel=mkL(s4,"Level: ---",1)
+local lblTarget=mkL(s4,"Target: None",2)
+local lblFarm=mkL(s4,"Auto Monster: Off",3)
+local lblCount=mkL(s4,"Monsters: 0",4)
+local lblIndex=mkL(s4,"Queue: 0/0",5)
+local lblHits=mkL(s4,"Hits: 0",6)
+local lblSpeed=mkL(s4,"Speed: 1.0s | Touch: 5x",7)
+local lblDebug=mkL(s4,"Debug: ---",8)
 
--- ========================
--- PAGE 2: AUTO EGG
--- ========================
-local p2 = mkPage("AutoEgg")
-local es1 = mkSec(p2, 1)
-mkH(es1, "PET EGG", 0)
-mkT(es1, "🥚 Auto Best Pet", 1, C.warn, function(v) autoPetOn = v end)
-mkL(es1, "Buys best pet egg every 2 seconds", 2)
-local es2 = mkSec(p2, 2)
-mkH(es2, "STATUS", 0)
-local lblPet = mkL(es2, "🐾 Pet: Off", 1)
-local lblPetCount = mkL(es2, "Eggs Bought: 0", 2)
+-- PAGE 2
+local p2=mkP("AutoEgg")
+local es1=mkSc(p2,1); mkH(es1,"PET EGG",0); mkT(es1,"🥚 Auto Best Pet",1,C.warn,function(v) autoPetOn=v end)
+local es2=mkSc(p2,2); mkH(es2,"STATUS",0); local lblPet=mkL(es2,"🐾 Pet: Off",1); local lblPetCount=mkL(es2,"Eggs Bought: 0",2)
 
--- ========================
--- PAGE 3: SETTINGS
--- ========================
-local p3 = mkPage("Settings")
-local ss1 = mkSec(p3, 1)
-mkH(ss1, "SERVER", 0)
-mkB(ss1, "🔄 Rejoin This Server", 1, C.acc, function()
-	TeleportService:TeleportToPlaceInstance(game.PlaceId, game.JobId, Player)
-end)
-mkB(ss1, "🌐 Join Lowest Server", 2, Color3.fromRGB(40, 140, 200), function() serverHopLowest() end)
+-- PAGE 3
+local p3=mkP("Settings")
+local ss1=mkSc(p3,1); mkH(ss1,"SERVER",0)
+mkB(ss1,"🔄 Rejoin This Server",1,C.acc,function() TeleportService:TeleportToPlaceInstance(game.PlaceId,game.JobId,Player) end)
+mkB(ss1,"🌐 Join Lowest Server",2,Color3.fromRGB(40,140,200),function() serverHopLowest() end)
+local ss2=mkSc(p3,2); mkH(ss2,"AUTO REJOIN",0); mkT(ss2,"🔁 Auto Rejoin on Kick",1,C.txt,function(v) autoRejoinOn=v end); local lblRejoin=mkL(ss2,"Status: Off",2)
+local ss3=mkSc(p3,3); mkH(ss3,"INFO",0); mkL(ss3,"Minimize: RightCtrl",1); mkL(ss3,"🚌 BUS HUB v6.2",2)
 
-local ss2 = mkSec(p3, 2)
-mkH(ss2, "AUTO REJOIN", 0)
-mkT(ss2, "🔁 Auto Rejoin on Kick", 1, C.txt, function(v) autoRejoinOn = v end)
-local lblRejoin = mkL(ss2, "Status: Off", 2)
-
-local ss3 = mkSec(p3, 3)
-mkH(ss3, "INFO", 0)
-mkL(ss3, "Minimize: RightCtrl", 1)
-mkL(ss3, "🚌 BUS HUB v6.0", 2)
-
--- ========================
 -- DRAG
--- ========================
-do
-	local dg, di, ds, sp = false, nil, nil, nil
-	Bar.InputBegan:Connect(function(i)
-		if i.UserInputType == Enum.UserInputType.MouseButton1 then
-			dg = true; ds = i.Position; sp = Main.Position
-			i.Changed:Connect(function() if i.UserInputState == Enum.UserInputState.End then dg = false end end)
-		end
-	end)
-	Bar.InputChanged:Connect(function(i) if i.UserInputType == Enum.UserInputType.MouseMovement then di = i end end)
-	UserInputService.InputChanged:Connect(function(i)
-		if i == di and dg then
-			local d = i.Position - ds
-			Main.Position = UDim2.new(sp.X.Scale, sp.X.Offset + d.X, sp.Y.Scale, sp.Y.Offset + d.Y)
-		end
-	end)
+do local dg,di,ds,sp=false,nil,nil,nil
+	Bar.InputBegan:Connect(function(i) if i.UserInputType==Enum.UserInputType.MouseButton1 then dg=true;ds=i.Position;sp=Main.Position;i.Changed:Connect(function() if i.UserInputState==Enum.UserInputState.End then dg=false end end) end end)
+	Bar.InputChanged:Connect(function(i) if i.UserInputType==Enum.UserInputType.MouseMovement then di=i end end)
+	UserInputService.InputChanged:Connect(function(i) if i==di and dg then local d=i.Position-ds;Main.Position=UDim2.new(sp.X.Scale,sp.X.Offset+d.X,sp.Y.Scale,sp.Y.Offset+d.Y) end end)
 end
 
-local full = Main.Size
-local function toggleMin()
-	minimized = not minimized
-	if minimized then
-		ContentArea.Visible = false; TabBar.Visible = false
-		TweenService:Create(Main, TweenInfo.new(0.2), {Size = UDim2.new(0, 340, 0, 40)}):Play()
-		MinBtn.Text = "+"
-	else
-		TweenService:Create(Main, TweenInfo.new(0.2), {Size = full}):Play()
-		task.delay(0.2, function() ContentArea.Visible = true; TabBar.Visible = true end)
-		MinBtn.Text = "—"
-	end
-end
+local full=Main.Size
+local function toggleMin() minimized=not minimized;if minimized then CA.Visible=false;TB.Visible=false;TweenService:Create(Main,TweenInfo.new(0.2),{Size=UDim2.new(0,340,0,40)}):Play();MinBtn.Text="+" else TweenService:Create(Main,TweenInfo.new(0.2),{Size=full}):Play();task.delay(0.2,function() CA.Visible=true;TB.Visible=true end);MinBtn.Text="—" end end
 MinBtn.MouseButton1Click:Connect(toggleMin)
-UserInputService.InputBegan:Connect(function(i, g) if not g and i.KeyCode == Enum.KeyCode.RightControl then toggleMin() end end)
+UserInputService.InputBegan:Connect(function(i,g) if not g and i.KeyCode==Enum.KeyCode.RightControl then toggleMin() end end)
 
 -- ========================
--- AUTO PET LOOP
+-- AUTO ATTACK LOOP
 -- ========================
-local eggsCount = 0
 task.spawn(function()
 	while true do
-		if autoPetOn then
-			firePetEggBuy()
-			eggsCount += 1
-			lblPet.Text = "🐾 Pet: Buying..."
-			lblPetCount.Text = "Eggs Bought: " .. eggsCount
-		else lblPet.Text = "🐾 Pet: Off" end
+		if autoMonsterOn then
+			if not autoAttackFired then
+				fireAutoAttackOn()
+				autoAttackFired = true
+			end
+			fireAutoAttackOn()
+		else
+			if autoAttackFired then
+				fireAutoAttackOff()
+				autoAttackFired = false
+			end
+		end
 		task.wait(2)
 	end
 end)
 
--- ========================
--- AUTO REJOIN
--- ========================
-game:GetService("GuiService").ErrorMessageChanged:Connect(function()
-	if autoRejoinOn then task.wait(3); TeleportService:Teleport(game.PlaceId, Player) end
-end)
-pcall(function()
-	local ef = game:GetService("CoreGui"):WaitForChild("RobloxPromptGui", 5)
-	if ef then ef.DescendantAdded:Connect(function()
-		if autoRejoinOn then task.wait(3); TeleportService:Teleport(game.PlaceId, Player) end
-	end) end
-end)
-task.spawn(function()
-	while true do
-		lblRejoin.Text = autoRejoinOn and "Status: ✅ Watching" or "Status: Off"
-		task.wait(1)
-	end
-end)
+-- PET LOOP
+local eggsCount=0
+task.spawn(function() while true do if autoPetOn then firePetEggBuy();eggsCount+=1;lblPet.Text="🐾 Pet: Buying...";lblPetCount.Text="Eggs Bought: "..eggsCount else lblPet.Text="🐾 Pet: Off" end;task.wait(2) end end)
+
+-- REJOIN
+game:GetService("GuiService").ErrorMessageChanged:Connect(function() if autoRejoinOn then task.wait(3);TeleportService:Teleport(game.PlaceId,Player) end end)
+pcall(function() local ef=game:GetService("CoreGui"):WaitForChild("RobloxPromptGui",5);if ef then ef.DescendantAdded:Connect(function() if autoRejoinOn then task.wait(3);TeleportService:Teleport(game.PlaceId,Player) end end) end end)
+task.spawn(function() while true do lblRejoin.Text=autoRejoinOn and "Status: ✅ Watching" or "Status: Off";task.wait(1) end end)
 
 -- ========================
 -- AUTO MONSTER LOOP
 -- ========================
-local totalHits = 0
+local totalHits=0
 
 task.spawn(function()
-	local monsterList = {}
-	local currentIndex = 0
-	local lastLevel = -1
+	local monsterList={}
+	local currentIndex=0
+	local lastLevel=-1
 
 	while true do
-		if not Char or not Char.Parent then Char = waitChar() end
-
-		local playerLevel = getLevel()
-		lblLevel.Text = "Level: " .. tostring(playerLevel)
-		lblSpeed.Text = "Speed: " .. string.format("%.1f", farmSpeed) .. "s | Touch: " .. touchHits .. "x"
+		if not Char or not Char.Parent then Char=waitChar() end
+		local playerLevel=getLevel()
+		lblLevel.Text="Level: "..tostring(playerLevel)
+		lblSpeed.Text="Speed: "..string.format("%.1f",farmSpeed).."s | Touch: "..touchHits.."x"
 
 		if autoMonsterOn then
-			local farmLevel = selectedLevel or playerLevel
+			local farmLevel=selectedLevel or playerLevel
 
-			if farmLevel ~= lastLevel or #monsterList == 0 then
-				monsterList = buildMonsterList(farmLevel)
-				currentIndex = 0
-				lastLevel = farmLevel
-				lblDebug.Text = "Debug: Built list for Lv." .. farmLevel .. " = " .. #monsterList .. " monsters"
+			if farmLevel~=lastLevel or #monsterList==0 then
+				monsterList=buildMonsterList(farmLevel)
+				currentIndex=0
+				lastLevel=farmLevel
 			end
 
-			lblCount.Text = "Monsters: " .. #monsterList .. " (Lv." .. farmLevel .. ")"
+			lblCount.Text="Monsters: "..#monsterList.." (Lv."..farmLevel..")"
 
-			if #monsterList == 0 then
-				lblFarm.Text = "Auto Monster: No monsters"
-				lblTarget.Text = "Target: None"
-				lblIndex.Text = "Queue: 0/0"
-
-				-- Debug: show what is in Monster folder
-				local folder = workspace:FindFirstChild("Monster")
+			if #monsterList==0 then
+				lblFarm.Text="Auto Monster: No monsters"
+				lblTarget.Text="Target: None"
+				lblIndex.Text="Queue: 0/0"
+				local folder=workspace:FindFirstChild("Monster")
 				if folder then
-					local sample = {}
-					for idx, ch in ipairs(folder:GetChildren()) do
-						if idx <= 5 then table.insert(sample, ch.Name) end
-					end
-					lblDebug.Text = "Debug: Folder has " .. #folder:GetChildren() .. " children. Sample: " .. table.concat(sample, ", ")
+					local sample={}
+					for idx,ch in ipairs(folder:GetChildren()) do if idx<=5 then table.insert(sample,ch.Name) end end
+					lblDebug.Text="Folder: "..#folder:GetChildren().." | "..table.concat(sample,", ")
 				else
-					lblDebug.Text = "Debug: No Monster folder in workspace!"
+					lblDebug.Text="No Monster folder!"
 				end
-
 				task.wait(1)
 				continue
 			end
 
-			currentIndex += 1
-			if currentIndex > #monsterList then
-				monsterList = buildMonsterList(farmLevel)
-				currentIndex = 1
-				if #monsterList == 0 then task.wait(1) continue end
+			currentIndex+=1
+			if currentIndex>#monsterList then
+				monsterList=buildMonsterList(farmLevel)
+				currentIndex=1
+				if #monsterList==0 then task.wait(1) continue end
 			end
 
-			local target = monsterList[currentIndex]
+			local target=monsterList[currentIndex]
 			if not target or not target.Parent then
-				monsterList = buildMonsterList(farmLevel)
-				currentIndex = 1
-				if #monsterList == 0 then task.wait(1) continue end
-				target = monsterList[currentIndex]
+				monsterList=buildMonsterList(farmLevel)
+				currentIndex=1
+				if #monsterList==0 then task.wait(1) continue end
+				target=monsterList[currentIndex]
 			end
 
-			lblTarget.Text = "Target: " .. target.Name
-			lblIndex.Text = "Queue: " .. currentIndex .. "/" .. #monsterList
-			lblFarm.Text = "Auto Monster: Hitting"
+			lblTarget.Text="Target: "..target.Name
+			lblIndex.Text="Queue: "..currentIndex.."/"..#monsterList
+			lblFarm.Text="Auto Monster: Hitting"
 
-			-- Debug: show what we found inside the monster
-			local debugParts = {}
-			for _, desc in ipairs(target:GetDescendants()) do
-				table.insert(debugParts, desc.Name .. "(" .. desc.ClassName .. ")")
+			-- Show what's inside monster for debug
+			local parts={}
+			for _,desc in ipairs(target:GetDescendants()) do
+				table.insert(parts, desc.Name)
 			end
-			lblDebug.Text = "Inside: " .. table.concat(debugParts, ", ")
+			lblDebug.Text="Inside: "..table.concat(parts,", ")
 
-			for i = 1, touchHits do
+			for i=1,touchHits do
 				if not autoMonsterOn then break end
 				if not target or not target.Parent then break end
-
-				local success = teleportAndAttack(target)
-				if success then
-					totalHits += 1
-					lblHits.Text = "Hits: " .. totalHits
-				end
-
+				local success=teleportAndAttack(target)
+				if success then totalHits+=1;lblHits.Text="Hits: "..totalHits end
 				task.wait(0.05)
 			end
 
 			task.wait(farmSpeed)
 		else
-			monsterList = {}
-			currentIndex = 0
-			lastLevel = -1
-			lblFarm.Text = "Auto Monster: Off"
-			lblTarget.Text = "Target: None"
-			lblCount.Text = "Monsters: 0"
-			lblIndex.Text = "Queue: 0/0"
-			lblDebug.Text = "Debug: ---"
+			monsterList={};currentIndex=0;lastLevel=-1
+			lblFarm.Text="Auto Monster: Off"
+			lblTarget.Text="Target: None"
+			lblCount.Text="Monsters: 0"
+			lblIndex.Text="Queue: 0/0"
+			lblDebug.Text="Debug: ---"
 			task.wait(0.5)
 		end
 	end
