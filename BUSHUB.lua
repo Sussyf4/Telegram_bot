@@ -160,39 +160,28 @@ local PetEggBuyRemote = findRemote("PetEgg/PetEggBuy")
 
 local function firePetEggBuy()
 	if PetEggBuyRemote then PetEggBuyRemote:FireServer(30)
-	else
-		pcall(function() ReplicatedStorage["PetEgg/PetEggBuy"]:FireServer(30) end)
-	end
+	else pcall(function() ReplicatedStorage["PetEgg/PetEggBuy"]:FireServer(30) end) end
 end
 
 -- ========================
--- AUTO ATTACK REMOTE
--- Setting/ChangeSetting with "AutoAttack" true/false
--- The remote name literally has a slash in it
+-- AUTO ATTACK REMOTE - 4 METHODS
 -- ========================
 local function fireAutoAttack(enabled)
-	-- Try all possible ways to find and fire this remote
 	local fired = false
-
-	-- Method 1: bracket notation (name has slash)
 	pcall(function()
 		ReplicatedStorage["Setting/ChangeSetting"]:FireServer("AutoAttack", enabled)
 		fired = true
 	end)
-
 	if not fired then
-		-- Method 2: folder path
 		pcall(function()
 			ReplicatedStorage.Setting.ChangeSetting:FireServer("AutoAttack", enabled)
 			fired = true
 		end)
 	end
-
 	if not fired then
-		-- Method 3: search all descendants
 		pcall(function()
 			for _, desc in ipairs(ReplicatedStorage:GetDescendants()) do
-				if desc.Name == "ChangeSetting" and (desc:IsA("RemoteEvent") or desc:IsA("RemoteFunction")) then
+				if desc.Name == "ChangeSetting" then
 					desc:FireServer("AutoAttack", enabled)
 					fired = true
 					break
@@ -200,26 +189,21 @@ local function fireAutoAttack(enabled)
 			end
 		end)
 	end
-
 	if not fired then
-		-- Method 4: search by exact full name
 		pcall(function()
 			for _, child in ipairs(ReplicatedStorage:GetChildren()) do
 				if child.Name == "Setting/ChangeSetting" then
 					child:FireServer("AutoAttack", enabled)
-					fired = true
 					break
 				end
 			end
 		end)
 	end
-
-	return fired
 end
 
 -- ========================
 -- TELEPORT BEHIND MONSTER + FIRE TOUCH
--- Teleport to same Y as monster, NOT above
+-- Same Y as monster, 4 studs behind, face monster
 -- ========================
 local function teleportAndAttack(monsterModel)
 	if not monsterModel or not monsterModel.Parent then return false end
@@ -235,18 +219,17 @@ local function teleportAndAttack(monsterModel)
 	local touchInterest = attackPart:FindFirstChild("TouchInterest")
 	if not touchInterest then return false end
 
-	-- Get monster position and facing
 	local mPos = monsterRoot.Position
 	local mLook = monsterRoot.CFrame.LookVector
 
-	-- Behind monster: same Y, 4 studs behind where monster faces
+	-- Behind monster, SAME Y height
 	local behindPos = Vector3.new(
 		mPos.X - mLook.X * 4,
 		mPos.Y,
 		mPos.Z - mLook.Z * 4
 	)
 
-	-- Face toward monster
+	-- Face toward monster at same Y
 	myRoot.CFrame = CFrame.new(behindPos, Vector3.new(mPos.X, behindPos.Y, mPos.Z))
 	myRoot.AssemblyLinearVelocity = Vector3.zero
 	myRoot.AssemblyAngularVelocity = Vector3.zero
@@ -260,24 +243,21 @@ local function teleportAndAttack(monsterModel)
 		end)
 		return true
 	end
-
 	return false
 end
 
 -- ========================
--- SERVER HOP
+-- SERVER HOP LOWEST
 -- ========================
 local function serverHopLowest()
 	local placeId = game.PlaceId
 	local currentJobId = game.JobId
 	local lowestPlayers = math.huge
 	local lowestServerId = nil
-
 	local success, result = pcall(function()
 		local url = "https://games.roblox.com/v1/games/" .. placeId .. "/servers/Public?sortOrder=Asc&limit=100"
 		return HttpService:JSONDecode(game:HttpGet(url))
 	end)
-
 	if success and result and result.data then
 		for _, server in ipairs(result.data) do
 			if server.playing and server.id ~= currentJobId then
@@ -288,7 +268,6 @@ local function serverHopLowest()
 			end
 		end
 	end
-
 	if lowestServerId then
 		TeleportService:TeleportToPlaceInstance(placeId, lowestServerId, Player)
 	else
@@ -300,30 +279,21 @@ end
 -- COLORS
 -- ========================
 local C = {
-	bg = Color3.fromRGB(12, 12, 20),
-	bar = Color3.fromRGB(18, 18, 30),
-	barAccent = Color3.fromRGB(80, 50, 200),
-	acc = Color3.fromRGB(80, 50, 200),
-	on = Color3.fromRGB(30, 170, 70),
-	off = Color3.fromRGB(170, 30, 30),
-	txt = Color3.fromRGB(220, 220, 235),
-	dim = Color3.fromRGB(100, 100, 125),
-	sec = Color3.fromRGB(18, 18, 28),
-	brd = Color3.fromRGB(35, 35, 52),
-	drop = Color3.fromRGB(14, 14, 24),
-	hover = Color3.fromRGB(30, 30, 45),
-	tabActive = Color3.fromRGB(80, 50, 200),
-	tabInactive = Color3.fromRGB(24, 24, 38),
-	tabTxtActive = Color3.fromRGB(255, 255, 255),
-	tabTxtInactive = Color3.fromRGB(90, 90, 115),
+	bg = Color3.fromRGB(12, 12, 20), bar = Color3.fromRGB(18, 18, 30),
+	barAccent = Color3.fromRGB(80, 50, 200), acc = Color3.fromRGB(80, 50, 200),
+	on = Color3.fromRGB(30, 170, 70), off = Color3.fromRGB(170, 30, 30),
+	txt = Color3.fromRGB(220, 220, 235), dim = Color3.fromRGB(100, 100, 125),
+	sec = Color3.fromRGB(18, 18, 28), brd = Color3.fromRGB(35, 35, 52),
+	drop = Color3.fromRGB(14, 14, 24), hover = Color3.fromRGB(30, 30, 45),
+	tabActive = Color3.fromRGB(80, 50, 200), tabInactive = Color3.fromRGB(24, 24, 38),
+	tabTxtActive = Color3.fromRGB(255, 255, 255), tabTxtInactive = Color3.fromRGB(90, 90, 115),
 	warn = Color3.fromRGB(220, 160, 40),
-	sliderTrack = Color3.fromRGB(30, 30, 45),
-	sliderFill = Color3.fromRGB(60, 40, 160),
+	sliderTrack = Color3.fromRGB(30, 30, 45), sliderFill = Color3.fromRGB(60, 40, 160),
 	sliderKnob = Color3.fromRGB(130, 100, 255),
 }
 
 -- ========================
--- GUI SETUP
+-- GUI
 -- ========================
 local Gui = Instance.new("ScreenGui")
 Gui.Name = "BusHub"
@@ -341,18 +311,6 @@ Main.Parent = Gui
 Instance.new("UICorner", Main).CornerRadius = UDim.new(0, 10)
 Instance.new("UIStroke", Main).Color = C.brd
 
-local shadow = Instance.new("ImageLabel")
-shadow.Size = UDim2.new(1, 30, 1, 30)
-shadow.Position = UDim2.new(0, -15, 0, -15)
-shadow.BackgroundTransparency = 1
-shadow.Image = "rbxassetid://6015897843"
-shadow.ImageColor3 = Color3.new(0, 0, 0)
-shadow.ImageTransparency = 0.4
-shadow.ScaleType = Enum.ScaleType.Slice
-shadow.SliceCenter = Rect.new(49, 49, 450, 450)
-shadow.ZIndex = 0
-shadow.Parent = Main
-
 -- TITLE BAR
 local Bar = Instance.new("Frame")
 Bar.Size = UDim2.new(1, 0, 0, 40)
@@ -360,6 +318,7 @@ Bar.BackgroundColor3 = C.bar
 Bar.BorderSizePixel = 0
 Bar.Parent = Main
 Instance.new("UICorner", Bar).CornerRadius = UDim.new(0, 10)
+
 local barFix = Instance.new("Frame")
 barFix.Size = UDim2.new(1, 0, 0, 12)
 barFix.Position = UDim2.new(0, 0, 1, -12)
@@ -374,20 +333,22 @@ accentLine.BackgroundColor3 = C.barAccent
 accentLine.BorderSizePixel = 0
 accentLine.Parent = Bar
 
-Instance.new("TextLabel", Bar).Size = UDim2.new(0, 130, 1, 0)
-Bar:FindFirstChildOfClass("TextLabel").Position = UDim2.new(0, 14, 0, 0)
-Bar:FindFirstChildOfClass("TextLabel").BackgroundTransparency = 1
-Bar:FindFirstChildOfClass("TextLabel").Text = "🚌 BUS HUB"
-Bar:FindFirstChildOfClass("TextLabel").TextColor3 = C.txt
-Bar:FindFirstChildOfClass("TextLabel").TextSize = 16
-Bar:FindFirstChildOfClass("TextLabel").Font = Enum.Font.GothamBold
-Bar:FindFirstChildOfClass("TextLabel").TextXAlignment = Enum.TextXAlignment.Left
+local Logo = Instance.new("TextLabel")
+Logo.Size = UDim2.new(0, 130, 1, 0)
+Logo.Position = UDim2.new(0, 14, 0, 0)
+Logo.BackgroundTransparency = 1
+Logo.Text = "🚌 BUS HUB"
+Logo.TextColor3 = C.txt
+Logo.TextSize = 16
+Logo.Font = Enum.Font.GothamBold
+Logo.TextXAlignment = Enum.TextXAlignment.Left
+Logo.Parent = Bar
 
 local VerLbl = Instance.new("TextLabel")
 VerLbl.Size = UDim2.new(0, 36, 0, 16)
 VerLbl.Position = UDim2.new(0, 132, 0.5, -8)
 VerLbl.BackgroundColor3 = C.acc
-VerLbl.Text = "v5.2"
+VerLbl.Text = "v5.3"
 VerLbl.TextColor3 = Color3.new(1, 1, 1)
 VerLbl.TextSize = 9
 VerLbl.Font = Enum.Font.GothamBold
@@ -417,15 +378,16 @@ tabLay.FillDirection = Enum.FillDirection.Horizontal
 tabLay.Padding = UDim.new(0, 4)
 tabLay.SortOrder = Enum.SortOrder.LayoutOrder
 
-local tabDefs = {
+local tabButtons = {}
+local tabPages = {}
+
+local tabNames = {
 	{name = "AutoFarm", display = "⚔ Monster"},
 	{name = "AutoEgg", display = "🥚 Egg"},
 	{name = "Settings", display = "⚙ Settings"},
 }
-local tabButtons = {}
-local tabPages = {}
 
-for i, def in ipairs(tabDefs) do
+for i, def in ipairs(tabNames) do
 	local btn = Instance.new("TextButton")
 	btn.Size = UDim2.new(0, 100, 1, 0)
 	btn.BackgroundColor3 = (i == 1) and C.tabActive or C.tabInactive
@@ -567,9 +529,6 @@ local function mkButton(par, name, ord, color, cb)
 	btn.MouseButton1Click:Connect(function() if cb then cb() end end)
 end
 
--- ========================
--- FIXED SLIDER - one dragging state per slider, no conflicts
--- ========================
 local function mkSlider(par, name, ord, minVal, maxVal, defaultVal, isInt, suffix, cb)
 	local container = Instance.new("Frame")
 	container.Size = UDim2.new(1, 0, 0, 46)
@@ -603,7 +562,7 @@ local function mkSlider(par, name, ord, minVal, maxVal, defaultVal, isInt, suffi
 	valLbl.TextXAlignment = Enum.TextXAlignment.Right
 	valLbl.Parent = container
 
-	local track = Instance.new("TextButton") -- TextButton so it captures input
+	local track = Instance.new("TextButton")
 	track.Size = UDim2.new(1, 0, 0, 14)
 	track.Position = UDim2.new(0, 0, 0, 22)
 	track.BackgroundColor3 = C.sliderTrack
@@ -631,42 +590,37 @@ local function mkSlider(par, name, ord, minVal, maxVal, defaultVal, isInt, suffi
 	knob.Parent = track
 	Instance.new("UICorner", knob).CornerRadius = UDim.new(1, 0)
 
-	local thisSliderDragging = false
+	local isDragging = false
 
 	local function doUpdate(inputX)
 		local tPos = track.AbsolutePosition.X
 		local tSize = track.AbsoluteSize.X
 		if tSize == 0 then return end
 		local rel = math.clamp((inputX - tPos) / tSize, 0, 1)
-
 		fill.Size = UDim2.new(rel, 0, 1, 0)
 		knob.Position = UDim2.new(rel, -8, 0.5, -8)
-
 		local val = minVal + (maxVal - minVal) * rel
 		if isInt then val = math.floor(val + 0.5) end
 		if not isInt then val = math.floor(val * 10) / 10 end
 		val = math.clamp(val, minVal, maxVal)
-
 		valLbl.Text = fmtVal(val)
 		if cb then cb(val) end
 	end
 
-	track.MouseButton1Down:Connect(function(x, y)
-		thisSliderDragging = true
+	track.MouseButton1Down:Connect(function(x)
+		isDragging = true
 		doUpdate(x)
 	end)
 
 	UserInputService.InputChanged:Connect(function(input)
-		if thisSliderDragging then
-			if input.UserInputType == Enum.UserInputType.MouseMovement then
-				doUpdate(input.Position.X)
-			end
+		if isDragging and input.UserInputType == Enum.UserInputType.MouseMovement then
+			doUpdate(input.Position.X)
 		end
 	end)
 
 	UserInputService.InputEnded:Connect(function(input)
 		if input.UserInputType == Enum.UserInputType.MouseButton1 then
-			thisSliderDragging = false
+			isDragging = false
 		end
 	end)
 end
@@ -692,10 +646,8 @@ local farmToggles = mkSec(pageFarm, 1)
 mkHeader(farmToggles, "AUTO MONSTER", 0)
 mkToggle(farmToggles, "⚔ Auto Monster", 1, C.txt, function(v)
 	autoMonsterOn = v
-	-- Turn on/off auto attack on server
 	fireAutoAttack(v)
 end)
-mkLbl(farmToggles, "Teleports behind monsters, fires touch attack, auto attack on.", 2)
 
 local speedSec = mkSec(pageFarm, 2)
 mkHeader(speedSec, "ADJUSTMENTS", 0)
@@ -833,7 +785,7 @@ local lblRejoin = mkLbl(rejoinSec, "Status: Off", 3)
 local infoSec = mkSec(pageSettings, 3)
 mkHeader(infoSec, "INFO", 0)
 mkLbl(infoSec, "Minimize: RightCtrl", 1)
-mkLbl(infoSec, "🚌 BUS HUB v5.2", 2)
+mkLbl(infoSec, "🚌 BUS HUB v5.3", 2)
 
 -- ========================
 -- DRAG
@@ -971,7 +923,6 @@ task.spawn(function()
 			lblIndex.Text = "Queue: " .. currentIndex .. "/" .. #monsterList
 			lblFarm.Text = "Auto Monster: Hitting"
 
-			-- Fire touch (touchHits) times
 			for i = 1, touchHits do
 				if not autoMonsterOn then break end
 				if not target or not target.Parent then break end
@@ -985,7 +936,6 @@ task.spawn(function()
 				task.wait(0.05)
 			end
 
-			-- Wait user speed before next monster
 			task.wait(farmSpeed)
 		else
 			monsterList = {}
