@@ -27,6 +27,7 @@ local autoRejoinOn = false
 local minimized = false
 local selectedLevel = nil
 local currentCategory = "AutoFarm"
+local farmSpeed = 0.5 -- seconds between each monster (adjustable by slider)
 
 -- ========================
 -- MONSTER MAP
@@ -111,18 +112,14 @@ reg(68, {"monster68476","monster68477","monster68478","monster68479","monster684
 reg(69, {"monster69485","monster69486","monster69487","monster69488","monster69489","monster69490","monster69491","monster69492","monster69493"})
 reg(70, {"monster70494"})
 
-local function isMonsterForLevel(monsterName, level)
-	return MONSTER_TO_LEVEL[monsterName:lower()] == level
-end
+local function isMonsterForLevel(n, l) return MONSTER_TO_LEVEL[n:lower()] == l end
 
 local function buildMonsterList(level)
 	local folder = workspace:FindFirstChild("Monster")
 	if not folder then return {} end
 	local list = {}
-	for _, child in ipairs(folder:GetChildren()) do
-		if isMonsterForLevel(child.Name, level) then
-			table.insert(list, child)
-		end
+	for _, c in ipairs(folder:GetChildren()) do
+		if isMonsterForLevel(c.Name, level) then table.insert(list, c) end
 	end
 	table.sort(list, function(a, b) return a.Name < b.Name end)
 	return list
@@ -131,37 +128,30 @@ end
 local function countMonstersForLevel(level)
 	local folder = workspace:FindFirstChild("Monster")
 	if not folder then return 0 end
-	local count = 0
-	for _, child in ipairs(folder:GetChildren()) do
-		if isMonsterForLevel(child.Name, level) then count += 1 end
+	local n = 0
+	for _, c in ipairs(folder:GetChildren()) do
+		if isMonsterForLevel(c.Name, level) then n += 1 end
 	end
-	return count
+	return n
 end
 
 local function getAllLevels()
-	local levels = {}
-	for lv in pairs(LEVEL_MONSTERS) do table.insert(levels, lv) end
-	table.sort(levels)
-	return levels
+	local t = {}
+	for lv in pairs(LEVEL_MONSTERS) do table.insert(t, lv) end
+	table.sort(t)
+	return t
 end
 
 -- ========================
--- FIND REMOTES
+-- REMOTES
 -- ========================
 local function findRemote(name)
-	for _, child in ipairs(ReplicatedStorage:GetChildren()) do
-		if child.Name == name then return child end
-	end
-	for _, desc in ipairs(ReplicatedStorage:GetDescendants()) do
-		if desc.Name == name then return desc end
-	end
-	local parts = string.split(name, "/")
-	if #parts == 2 then
-		local folder = ReplicatedStorage:FindFirstChild(parts[1])
-		if folder then
-			local remote = folder:FindFirstChild(parts[2])
-			if remote then return remote end
-		end
+	for _, c in ipairs(ReplicatedStorage:GetChildren()) do if c.Name == name then return c end end
+	for _, d in ipairs(ReplicatedStorage:GetDescendants()) do if d.Name == name then return d end end
+	local p = string.split(name, "/")
+	if #p == 2 then
+		local f = ReplicatedStorage:FindFirstChild(p[1])
+		if f then local r = f:FindFirstChild(p[2]) if r then return r end end
 	end
 	return nil
 end
@@ -169,8 +159,7 @@ end
 local PetEggBuyRemote = findRemote("PetEgg/PetEggBuy")
 
 local function firePetEggBuy()
-	if PetEggBuyRemote then
-		PetEggBuyRemote:FireServer(30)
+	if PetEggBuyRemote then PetEggBuyRemote:FireServer(30)
 	else
 		pcall(function() ReplicatedStorage["PetEgg/PetEggBuy"]:FireServer(30) end)
 		pcall(function() ReplicatedStorage.PetEgg.PetEggBuy:FireServer(30) end)
@@ -178,47 +167,50 @@ local function firePetEggBuy()
 end
 
 -- ========================
--- MOVE MONSTER IN FRONT OF PLAYER + FIRE TOUCH
--- Monster Model > HumanoidRootPart (Part) > AttackPart (Part) > TouchInterest
+-- TELEPORT BEHIND MONSTER + FIRE TOUCH
 -- ========================
-local function moveMonsterAndAttack(monsterModel)
+local function teleportAndAttack(monsterModel)
 	if not monsterModel or not monsterModel.Parent then return false end
 	if not Char or not Char.Parent then return false end
 
 	local myRoot = Char:FindFirstChild("HumanoidRootPart")
 	if not myRoot then return false end
 
+	-- Get monster position from WorldPivot
+	local monsterPos = monsterModel:GetPivot().Position
+
+	-- Find AttackPart inside monster
 	local monsterRoot = monsterModel:FindFirstChild("HumanoidRootPart")
 	if not monsterRoot then return false end
-
 	local attackPart = monsterRoot:FindFirstChild("AttackPart")
 	if not attackPart then return false end
-
-	-- Move ENTIRE monster model in front of player at same Y height
-	-- 3 studs in front of where player is looking
-	local playerPos = myRoot.Position
-	local playerLook = myRoot.CFrame.LookVector
-	local targetPos = playerPos + (playerLook * 3)
-
-	-- Set the whole model pivot so everything moves together
-	-- Use PivotTo to move the entire model including all children
-	if monsterModel:IsA("Model") then
-		local currentPivot = monsterModel:GetPivot()
-		local newCFrame = CFrame.new(targetPos.X, playerPos.Y, targetPos.Z)
-		monsterModel:PivotTo(newCFrame)
-	end
-
-	-- Double check AttackPart is also at right position
-	-- (PivotTo should have moved it, but just in case)
 	local touchInterest = attackPart:FindFirstChild("TouchInterest")
 	if not touchInterest then return false end
 
-	-- Fire touch
+	-- Get monster facing direction
+	local monsterCF = monsterModel:GetPivot()
+	local monsterLook = monsterCF.LookVector
+
+	-- Teleport player BEHIND the monster
+	-- Behind = opposite of where monster is looking
+	local behindPos = monsterPos - (monsterLook * 4) -- 4 studs behind
+	local behindCF = CFrame.new(behindPos.X, monsterPos.Y, behindPos.Z, 
+		monsterLook.X, 0, monsterLook.Z, 
+		0, 1, 0, 
+		-monsterLook.Z, 0, monsterLook.X)
+	-- Simpler: just face toward monster
+	behindCF = CFrame.new(behindPos, monsterPos)
+
+	myRoot.CFrame = behindCF
+	myRoot.AssemblyLinearVelocity = Vector3.zero
+	myRoot.AssemblyAngularVelocity = Vector3.zero
+
+	-- Fire TouchInterest
 	if firetouchinterest then
 		pcall(function()
-			firetouchinterest(myRoot, attackPart, 0)
+			firetouchinterest(myRoot, attackPart, 0) -- begin
 			task.wait()
-			firetouchinterest(myRoot, attackPart, 1)
+			firetouchinterest(myRoot, attackPart, 1) -- end
 		end)
 		return true
 	end
@@ -227,15 +219,14 @@ local function moveMonsterAndAttack(monsterModel)
 end
 
 -- ========================
--- SERVER HOP - FIND LOWEST POPULATION SERVER
+-- SERVER HOP
 -- ========================
-local function findLowestServer()
+local function serverHopLowest()
 	local placeId = game.PlaceId
 	local currentJobId = game.JobId
 	local lowestPlayers = math.huge
 	local lowestServerId = nil
 
-	-- Try using Roblox API to get server list
 	local success, result = pcall(function()
 		local url = "https://games.roblox.com/v1/games/" .. placeId .. "/servers/Public?sortOrder=Asc&limit=100"
 		return HttpService:JSONDecode(game:HttpGet(url))
@@ -252,16 +243,10 @@ local function findLowestServer()
 		end
 	end
 
-	return lowestServerId, lowestPlayers
-end
-
-local function serverHopLowest()
-	local serverId, playerCount = findLowestServer()
-	if serverId then
-		TeleportService:TeleportToPlaceInstance(game.PlaceId, serverId, Player)
+	if lowestServerId then
+		TeleportService:TeleportToPlaceInstance(placeId, lowestServerId, Player)
 	else
-		-- Fallback: just teleport to any different server
-		TeleportService:Teleport(game.PlaceId, Player)
+		TeleportService:Teleport(placeId, Player)
 	end
 end
 
@@ -286,6 +271,9 @@ local C = {
 	tabTxtActive = Color3.fromRGB(255, 255, 255),
 	tabTxtInactive = Color3.fromRGB(90, 90, 115),
 	warn = Color3.fromRGB(220, 160, 40),
+	slider = Color3.fromRGB(60, 40, 160),
+	sliderBg = Color3.fromRGB(30, 30, 45),
+	sliderKnob = Color3.fromRGB(130, 100, 255),
 }
 
 -- ========================
@@ -298,8 +286,8 @@ Gui.ZIndexBehavior = Enum.ZIndexBehavior.Sibling
 Gui.Parent = Player:WaitForChild("PlayerGui")
 
 local Main = Instance.new("Frame")
-Main.Size = UDim2.new(0, 340, 0, 460)
-Main.Position = UDim2.new(0.5, -170, 0.5, -230)
+Main.Size = UDim2.new(0, 340, 0, 480)
+Main.Position = UDim2.new(0.5, -170, 0.5, -240)
 Main.BackgroundColor3 = C.bg
 Main.BorderSizePixel = 0
 Main.Active = true
@@ -332,7 +320,11 @@ barFix.BackgroundColor3 = C.bar
 barFix.BorderSizePixel = 0
 barFix.Parent = Bar
 
+Instance.new("Frame", Bar).Size = UDim2.new(1, -20, 0, 2)
+Bar:FindFirstChildOfClass("Frame").Position = UDim2.new(0, 10, 1, -1)
+-- fix: that created barFix duplicate, let me just do accent line properly
 local accentLine = Instance.new("Frame")
+accentLine.Name = "AccentLine"
 accentLine.Size = UDim2.new(1, -20, 0, 2)
 accentLine.Position = UDim2.new(0, 10, 1, -1)
 accentLine.BackgroundColor3 = C.barAccent
@@ -354,7 +346,7 @@ local VerLbl = Instance.new("TextLabel")
 VerLbl.Size = UDim2.new(0, 36, 0, 16)
 VerLbl.Position = UDim2.new(0, 132, 0.5, -8)
 VerLbl.BackgroundColor3 = C.acc
-VerLbl.Text = "v4.2"
+VerLbl.Text = "v5.0"
 VerLbl.TextColor3 = Color3.new(1, 1, 1)
 VerLbl.TextSize = 9
 VerLbl.Font = Enum.Font.GothamBold
@@ -413,6 +405,7 @@ ContentArea.BackgroundTransparency = 1
 ContentArea.ClipsDescendants = true
 ContentArea.Parent = Main
 
+-- HELPERS
 local function mkPage(name)
 	local page = Instance.new("ScrollingFrame")
 	page.Size = UDim2.new(1, 0, 1, 0)
@@ -530,6 +523,132 @@ local function mkButton(par, name, ord, color, cb)
 	btn.MouseButton1Click:Connect(function() if cb then cb() end end)
 end
 
+-- ========================
+-- SLIDER HELPER
+-- min/max in seconds, returns the value label so we can update it
+-- ========================
+local function mkSlider(par, name, ord, minVal, maxVal, defaultVal, cb)
+	local container = Instance.new("Frame")
+	container.Size = UDim2.new(1, 0, 0, 50)
+	container.BackgroundTransparency = 1
+	container.LayoutOrder = ord
+	container.Parent = par
+
+	-- Label row
+	local labelRow = Instance.new("Frame")
+	labelRow.Size = UDim2.new(1, 0, 0, 18)
+	labelRow.BackgroundTransparency = 1
+	labelRow.Parent = container
+
+	local nameLbl = Instance.new("TextLabel")
+	nameLbl.Size = UDim2.new(0.6, 0, 1, 0)
+	nameLbl.BackgroundTransparency = 1
+	nameLbl.Text = name
+	nameLbl.TextColor3 = C.txt
+	nameLbl.TextSize = 12
+	nameLbl.Font = Enum.Font.GothamMedium
+	nameLbl.TextXAlignment = Enum.TextXAlignment.Left
+	nameLbl.Parent = labelRow
+
+	local valLbl = Instance.new("TextLabel")
+	valLbl.Size = UDim2.new(0.4, 0, 1, 0)
+	valLbl.BackgroundTransparency = 1
+	valLbl.Text = string.format("%.1fs", defaultVal)
+	valLbl.TextColor3 = C.sliderKnob
+	valLbl.TextSize = 12
+	valLbl.Font = Enum.Font.GothamBold
+	valLbl.TextXAlignment = Enum.TextXAlignment.Right
+	valLbl.Parent = labelRow
+
+	-- Slider track
+	local track = Instance.new("Frame")
+	track.Size = UDim2.new(1, 0, 0, 8)
+	track.Position = UDim2.new(0, 0, 0, 26)
+	track.BackgroundColor3 = C.sliderBg
+	track.BorderSizePixel = 0
+	track.Parent = container
+	Instance.new("UICorner", track).CornerRadius = UDim.new(1, 0)
+
+	-- Fill bar
+	local fill = Instance.new("Frame")
+	local startFill = (defaultVal - minVal) / (maxVal - minVal)
+	fill.Size = UDim2.new(startFill, 0, 1, 0)
+	fill.BackgroundColor3 = C.slider
+	fill.BorderSizePixel = 0
+	fill.Parent = track
+	Instance.new("UICorner", fill).CornerRadius = UDim.new(1, 0)
+
+	-- Knob
+	local knob = Instance.new("TextButton")
+	knob.Size = UDim2.new(0, 18, 0, 18)
+	knob.Position = UDim2.new(startFill, -9, 0.5, -9)
+	knob.BackgroundColor3 = C.sliderKnob
+	knob.Text = ""
+	knob.BorderSizePixel = 0
+	knob.ZIndex = 5
+	knob.Parent = track
+	Instance.new("UICorner", knob).CornerRadius = UDim.new(1, 0)
+
+	-- Drag logic
+	local dragging = false
+
+	local function updateSlider(inputX)
+		local trackAbsPos = track.AbsolutePosition.X
+		local trackAbsSize = track.AbsoluteSize.X
+		local relX = math.clamp((inputX - trackAbsPos) / trackAbsSize, 0, 1)
+
+		fill.Size = UDim2.new(relX, 0, 1, 0)
+		knob.Position = UDim2.new(relX, -9, 0.5, -9)
+
+		local val = minVal + (maxVal - minVal) * relX
+		val = math.floor(val * 10) / 10 -- round to 0.1
+		valLbl.Text = string.format("%.1fs", val)
+
+		if cb then cb(val) end
+	end
+
+	knob.InputBegan:Connect(function(input)
+		if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
+			dragging = true
+		end
+	end)
+
+	knob.InputEnded:Connect(function(input)
+		if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
+			dragging = false
+		end
+	end)
+
+	-- Also allow clicking anywhere on track
+	track.InputBegan:Connect(function(input)
+		if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
+			dragging = true
+			updateSlider(input.Position.X)
+		end
+	end)
+
+	track.InputEnded:Connect(function(input)
+		if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
+			dragging = false
+		end
+	end)
+
+	UserInputService.InputChanged:Connect(function(input)
+		if dragging and (input.UserInputType == Enum.UserInputType.MouseMovement or input.UserInputType == Enum.UserInputType.Touch) then
+			updateSlider(input.Position.X)
+		end
+	end)
+
+	UserInputService.InputEnded:Connect(function(input)
+		if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
+			dragging = false
+		end
+	end)
+
+	return valLbl
+end
+
+-- TAB SWITCHING
 local function switchTab(tabName)
 	currentCategory = tabName
 	for name, page in pairs(tabPages) do page.Visible = (name == tabName) end
@@ -550,9 +669,18 @@ local pageFarm = mkPage("AutoFarm")
 local farmToggles = mkSec(pageFarm, 1)
 mkHeader(farmToggles, "AUTO MONSTER", 0)
 mkToggle(farmToggles, "⚔ Auto Monster", 1, C.txt, function(v) autoMonsterOn = v end)
-mkLbl(farmToggles, "Moves monsters in front of you and attacks. You stay in place.", 2)
+mkLbl(farmToggles, "Teleports behind each monster, fires attack, moves to next.", 2)
 
-local farmSelect = mkSec(pageFarm, 2)
+-- Speed slider
+local speedSec = mkSec(pageFarm, 2)
+mkHeader(speedSec, "SPEED SETTINGS", 0)
+mkSlider(speedSec, "⏱ Teleport Speed", 1, 0.1, 3.0, 0.5, function(val)
+	farmSpeed = val
+end)
+mkLbl(speedSec, "Lower = faster (0.1s min). Higher = slower (3.0s max).", 2)
+
+-- Dropdown
+local farmSelect = mkSec(pageFarm, 3)
 mkHeader(farmSelect, "SELECT MONSTER LEVEL", 0)
 
 local dropBtn = Instance.new("TextButton")
@@ -638,7 +766,8 @@ end
 mkButton(farmSelect, "🔄 Refresh List", 3, C.acc, populateDropdown)
 task.delay(1, populateDropdown)
 
-local farmStatus = mkSec(pageFarm, 3)
+-- Status
+local farmStatus = mkSec(pageFarm, 4)
 mkHeader(farmStatus, "STATUS", 0)
 local lblLevel = mkLbl(farmStatus, "Level: ---", 1)
 local lblTarget = mkLbl(farmStatus, "Target: None", 2)
@@ -646,6 +775,7 @@ local lblFarm = mkLbl(farmStatus, "Auto Monster: Off", 3)
 local lblCount = mkLbl(farmStatus, "Monsters: 0", 4)
 local lblIndex = mkLbl(farmStatus, "Queue: 0/0", 5)
 local lblHits = mkLbl(farmStatus, "Hits: 0", 6)
+local lblSpeed = mkLbl(farmStatus, "Speed: 0.5s", 7)
 
 -- ========================
 -- PAGE 2: AUTO EGG
@@ -672,7 +802,7 @@ end)
 mkButton(serverSec, "🌐 Join Lowest Population Server", 2, Color3.fromRGB(40, 140, 200), function()
 	serverHopLowest()
 end)
-mkLbl(serverSec, "Finds server with fewest players and joins it", 3)
+mkLbl(serverSec, "Finds server with fewest players via API", 3)
 
 local rejoinSec = mkSec(pageSettings, 2)
 mkHeader(rejoinSec, "AUTO REJOIN", 0)
@@ -683,8 +813,8 @@ local lblRejoin = mkLbl(rejoinSec, "Status: Off", 3)
 local infoSec = mkSec(pageSettings, 3)
 mkHeader(infoSec, "INFO", 0)
 mkLbl(infoSec, "Minimize: RightCtrl", 1)
-mkLbl(infoSec, "🚌 BUS HUB v4.2", 2)
-mkLbl(infoSec, "Players here: " .. #Players:GetPlayers() .. "/" .. Players.MaxPlayers, 3)
+mkLbl(infoSec, "🚌 BUS HUB v5.0", 2)
+mkLbl(infoSec, "Players: " .. #Players:GetPlayers() .. "/" .. Players.MaxPlayers, 3)
 
 -- ========================
 -- DRAG
@@ -737,9 +867,7 @@ task.spawn(function()
 			eggsCount += 1
 			lblPet.Text = "🐾 Pet: Buying..."
 			lblPetCount.Text = "Eggs Bought: " .. eggsCount
-		else
-			lblPet.Text = "🐾 Pet: Off"
-		end
+		else lblPet.Text = "🐾 Pet: Off" end
 		task.wait(2)
 	end
 end)
@@ -752,11 +880,9 @@ game:GetService("GuiService").ErrorMessageChanged:Connect(function()
 end)
 pcall(function()
 	local ef = game:GetService("CoreGui"):WaitForChild("RobloxPromptGui", 5)
-	if ef then
-		ef.DescendantAdded:Connect(function()
-			if autoRejoinOn then task.wait(3); TeleportService:Teleport(game.PlaceId, Player) end
-		end)
-	end
+	if ef then ef.DescendantAdded:Connect(function()
+		if autoRejoinOn then task.wait(3); TeleportService:Teleport(game.PlaceId, Player) end
+	end) end
 end)
 task.spawn(function()
 	while true do
@@ -767,13 +893,11 @@ end)
 
 -- ========================
 -- AUTO MONSTER LOOP
+-- Teleport behind monster → fire TouchInterest → next monster
 -- ========================
 local function getLevel()
 	local ls = Player:FindFirstChild("leaderstats")
-	if ls then
-		local lv = ls:FindFirstChild("Level")
-		if lv then return lv.Value end
-	end
+	if ls then local lv = ls:FindFirstChild("Level") if lv then return lv.Value end end
 	return 1
 end
 
@@ -789,6 +913,7 @@ task.spawn(function()
 
 		local playerLevel = getLevel()
 		lblLevel.Text = "Level: " .. tostring(playerLevel)
+		lblSpeed.Text = "Speed: " .. string.format("%.1fs", farmSpeed)
 
 		if autoMonsterOn then
 			local farmLevel = selectedLevel or playerLevel
@@ -828,21 +953,23 @@ task.spawn(function()
 			lblIndex.Text = "Queue: " .. currentIndex .. "/" .. #monsterList
 			lblFarm.Text = "Auto Monster: Hitting"
 
-			-- Fire 5 hits on this monster
+			-- Teleport behind monster and fire touch 5 times
 			for i = 1, 5 do
 				if not autoMonsterOn then break end
 				if not target or not target.Parent then break end
 
-				local success = moveMonsterAndAttack(target)
+				local success = teleportAndAttack(target)
 				if success then
 					totalHits += 1
 					lblHits.Text = "Hits: " .. totalHits
 				end
 
-				task.wait(0.1)
+				task.wait(0.05)
 			end
 
-			task.wait(0.1)
+			-- Wait user-defined speed before next monster
+			task.wait(farmSpeed)
+
 		else
 			monsterList = {}
 			currentIndex = 0
