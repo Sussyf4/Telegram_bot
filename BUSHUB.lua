@@ -1,5 +1,5 @@
 -- LocalScript: Place inside StarterPlayerScripts or StarterGui
--- BUS HUB v6.2
+-- BUS HUB v7.0
 
 local Players = game:GetService("Players")
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
@@ -28,7 +28,6 @@ local autoRejoinOn = false
 local minimized = false
 local selectedLevel = nil
 local farmSpeed = 1.0
-local touchHits = 5
 local autoAttackFired = false
 
 -- ========================
@@ -178,45 +177,28 @@ local function firePetEggBuy()
 end
 
 -- ========================
--- TELEPORT BEHIND + FIRE TOUCH
+-- TELEPORT ABOVE MONSTER FACING DOWN
+-- Player goes above monster and looks straight down at it
 -- ========================
-local function teleportAndAttack(monsterModel)
+local function teleportToMonster(monsterModel)
 	if not monsterModel or not monsterModel.Parent then return false end
 	if not Char or not Char.Parent then return false end
 	local myRoot = Char:FindFirstChild("HumanoidRootPart")
 	if not myRoot then return false end
 
 	local monsterPos = monsterModel:GetPivot().Position
-	local monsterLook = monsterModel:GetPivot().LookVector
 
-	local behindPos = Vector3.new(
-		monsterPos.X - monsterLook.X * 4,
-		monsterPos.Y,
-		monsterPos.Z - monsterLook.Z * 4
-	)
-	myRoot.CFrame = CFrame.new(behindPos, Vector3.new(monsterPos.X, behindPos.Y, monsterPos.Z))
+	-- Position: directly above monster, 5 studs up
+	local abovePos = Vector3.new(monsterPos.X, monsterPos.Y + 5, monsterPos.Z)
+
+	-- Face straight down: LookVector pointing down (0, -1, 0)
+	-- CFrame.new(position, lookAt) where lookAt is below us
+	local belowPos = Vector3.new(monsterPos.X, monsterPos.Y - 10, monsterPos.Z)
+	myRoot.CFrame = CFrame.new(abovePos, belowPos)
+
 	myRoot.AssemblyLinearVelocity = Vector3.zero
 	myRoot.AssemblyAngularVelocity = Vector3.zero
 
-	local attackPart = nil
-	for _, desc in ipairs(monsterModel:GetDescendants()) do
-		if desc.Name == "AttackPart" and desc:IsA("BasePart") then
-			if desc:FindFirstChild("TouchInterest") then attackPart = desc break end
-		end
-	end
-	if not attackPart then return false end
-
-	if type(firetouchinterest) == "function" then
-		firetouchinterest(myRoot, attackPart, 0)
-		task.wait()
-		firetouchinterest(myRoot, attackPart, 1)
-		return true
-	end
-
-	local saved = myRoot.CFrame
-	myRoot.CFrame = attackPart.CFrame
-	task.wait()
-	myRoot.CFrame = saved
 	return true
 end
 
@@ -262,7 +244,7 @@ Gui.Name="BusHub"; Gui.ResetOnSpawn=false; Gui.ZIndexBehavior=Enum.ZIndexBehavio
 Gui.Parent=Player:WaitForChild("PlayerGui")
 
 local Main = Instance.new("Frame")
-Main.Size=UDim2.new(0,340,0,500); Main.Position=UDim2.new(0.5,-170,0.5,-250)
+Main.Size=UDim2.new(0,340,0,480); Main.Position=UDim2.new(0.5,-170,0.5,-240)
 Main.BackgroundColor3=C.bg; Main.BorderSizePixel=0; Main.Active=true; Main.Parent=Gui
 Instance.new("UICorner",Main).CornerRadius=UDim.new(0,10)
 Instance.new("UIStroke",Main).Color=C.brd
@@ -272,7 +254,7 @@ Bar.Size=UDim2.new(1,0,0,40); Bar.BackgroundColor3=C.bar; Bar.BorderSizePixel=0;
 Instance.new("UICorner",Bar).CornerRadius=UDim.new(0,10)
 local bf=Instance.new("Frame"); bf.Size=UDim2.new(1,0,0,12); bf.Position=UDim2.new(0,0,1,-12); bf.BackgroundColor3=C.bar; bf.BorderSizePixel=0; bf.Parent=Bar
 local al=Instance.new("Frame"); al.Size=UDim2.new(1,-20,0,2); al.Position=UDim2.new(0,10,1,-1); al.BackgroundColor3=C.barAccent; al.BorderSizePixel=0; al.Parent=Bar
-local lg=Instance.new("TextLabel"); lg.Size=UDim2.new(0,160,1,0); lg.Position=UDim2.new(0,14,0,0); lg.BackgroundTransparency=1; lg.Text="🚌 BUS HUB v6.2"; lg.TextColor3=C.txt; lg.TextSize=15; lg.Font=Enum.Font.GothamBold; lg.TextXAlignment=Enum.TextXAlignment.Left; lg.Parent=Bar
+local lg=Instance.new("TextLabel"); lg.Size=UDim2.new(0,160,1,0); lg.Position=UDim2.new(0,14,0,0); lg.BackgroundTransparency=1; lg.Text="🚌 BUS HUB v7.0"; lg.TextColor3=C.txt; lg.TextSize=15; lg.Font=Enum.Font.GothamBold; lg.TextXAlignment=Enum.TextXAlignment.Left; lg.Parent=Bar
 local MinBtn=Instance.new("TextButton"); MinBtn.Size=UDim2.new(0,28,0,28); MinBtn.Position=UDim2.new(1,-38,0,6); MinBtn.BackgroundColor3=C.acc; MinBtn.Text="—"; MinBtn.TextColor3=C.txt; MinBtn.TextSize=16; MinBtn.Font=Enum.Font.GothamBold; MinBtn.BorderSizePixel=0; MinBtn.Parent=Bar; Instance.new("UICorner",MinBtn).CornerRadius=UDim.new(0,6)
 
 local TB=Instance.new("Frame"); TB.Size=UDim2.new(1,-20,0,30); TB.Position=UDim2.new(0,10,0,44); TB.BackgroundTransparency=1; TB.Parent=Main
@@ -317,10 +299,11 @@ for n,bt in pairs(tabButtons) do bt.MouseButton1Click:Connect(function() switchT
 local p1=mkP("AutoFarm")
 local s1=mkSc(p1,1); mkH(s1,"AUTO MONSTER",0)
 mkT(s1,"⚔ Auto Monster",1,C.txt,function(v) autoMonsterOn=v end)
+mkL(s1,"Teleports above each monster facing down. Auto attack handles damage.",2)
 
-local s2=mkSc(p1,2); mkH(s2,"ADJUSTMENTS",0)
-mkS(s2,"⏱ Teleport Speed",1, 0.1, 10.0, 1.0, false,"s",function(v) farmSpeed=v end)
-mkS(s2,"🗡 Touch Hits",2, 1, 20, 5, true,"x",function(v) touchHits=v end)
+local s2=mkSc(p1,2); mkH(s2,"TELEPORT SPEED",0)
+mkS(s2,"⏱ Speed (per monster)",1, 0.1, 10.0, 1.0, false,"s",function(v) farmSpeed=v end)
+mkL(s2,"How long to stay at each monster before moving to next.",2)
 
 local s3=mkSc(p1,3); mkH(s3,"SELECT MONSTER LEVEL",0)
 local dropBtn=Instance.new("TextButton"); dropBtn.Size=UDim2.new(1,0,0,30); dropBtn.BackgroundColor3=C.drop; dropBtn.Text="▼  Select Level..."; dropBtn.TextColor3=C.txt; dropBtn.TextSize=12; dropBtn.Font=Enum.Font.GothamMedium; dropBtn.TextXAlignment=Enum.TextXAlignment.Left; dropBtn.BorderSizePixel=0; dropBtn.LayoutOrder=1; dropBtn.Parent=s3; Instance.new("UICorner",dropBtn).CornerRadius=UDim.new(0,6); Instance.new("UIStroke",dropBtn).Color=C.brd; Instance.new("UIPadding",dropBtn).PaddingLeft=UDim.new(0,12)
@@ -346,9 +329,7 @@ local lblTarget=mkL(s4,"Target: None",2)
 local lblFarm=mkL(s4,"Auto Monster: Off",3)
 local lblCount=mkL(s4,"Monsters: 0",4)
 local lblIndex=mkL(s4,"Queue: 0/0",5)
-local lblHits=mkL(s4,"Hits: 0",6)
-local lblSpeed=mkL(s4,"Speed: 1.0s | Touch: 5x",7)
-local lblDebug=mkL(s4,"Debug: ---",8)
+local lblSpeed=mkL(s4,"Speed: 1.0s",6)
 
 -- PAGE 2
 local p2=mkP("AutoEgg")
@@ -361,7 +342,7 @@ local ss1=mkSc(p3,1); mkH(ss1,"SERVER",0)
 mkB(ss1,"🔄 Rejoin This Server",1,C.acc,function() TeleportService:TeleportToPlaceInstance(game.PlaceId,game.JobId,Player) end)
 mkB(ss1,"🌐 Join Lowest Server",2,Color3.fromRGB(40,140,200),function() serverHopLowest() end)
 local ss2=mkSc(p3,2); mkH(ss2,"AUTO REJOIN",0); mkT(ss2,"🔁 Auto Rejoin on Kick",1,C.txt,function(v) autoRejoinOn=v end); local lblRejoin=mkL(ss2,"Status: Off",2)
-local ss3=mkSc(p3,3); mkH(ss3,"INFO",0); mkL(ss3,"Minimize: RightCtrl",1); mkL(ss3,"🚌 BUS HUB v6.2",2)
+local ss3=mkSc(p3,3); mkH(ss3,"INFO",0); mkL(ss3,"Minimize: RightCtrl",1); mkL(ss3,"🚌 BUS HUB v7.0",2)
 
 -- DRAG
 do local dg,di,ds,sp=false,nil,nil,nil
@@ -376,21 +357,15 @@ MinBtn.MouseButton1Click:Connect(toggleMin)
 UserInputService.InputBegan:Connect(function(i,g) if not g and i.KeyCode==Enum.KeyCode.RightControl then toggleMin() end end)
 
 -- ========================
--- AUTO ATTACK LOOP
+-- AUTO ATTACK LOOP - keeps firing every 2 sec
 -- ========================
 task.spawn(function()
 	while true do
 		if autoMonsterOn then
-			if not autoAttackFired then
-				fireAutoAttackOn()
-				autoAttackFired = true
-			end
+			if not autoAttackFired then fireAutoAttackOn(); autoAttackFired=true end
 			fireAutoAttackOn()
 		else
-			if autoAttackFired then
-				fireAutoAttackOff()
-				autoAttackFired = false
-			end
+			if autoAttackFired then fireAutoAttackOff(); autoAttackFired=false end
 		end
 		task.wait(2)
 	end
@@ -407,8 +382,8 @@ task.spawn(function() while true do lblRejoin.Text=autoRejoinOn and "Status: ✅
 
 -- ========================
 -- AUTO MONSTER LOOP
+-- Teleport above monster facing down, auto attack does the damage
 -- ========================
-local totalHits=0
 
 task.spawn(function()
 	local monsterList={}
@@ -419,7 +394,7 @@ task.spawn(function()
 		if not Char or not Char.Parent then Char=waitChar() end
 		local playerLevel=getLevel()
 		lblLevel.Text="Level: "..tostring(playerLevel)
-		lblSpeed.Text="Speed: "..string.format("%.1f",farmSpeed).."s | Touch: "..touchHits.."x"
+		lblSpeed.Text="Speed: "..string.format("%.1f",farmSpeed).."s"
 
 		if autoMonsterOn then
 			local farmLevel=selectedLevel or playerLevel
@@ -436,14 +411,6 @@ task.spawn(function()
 				lblFarm.Text="Auto Monster: No monsters"
 				lblTarget.Text="Target: None"
 				lblIndex.Text="Queue: 0/0"
-				local folder=workspace:FindFirstChild("Monster")
-				if folder then
-					local sample={}
-					for idx,ch in ipairs(folder:GetChildren()) do if idx<=5 then table.insert(sample,ch.Name) end end
-					lblDebug.Text="Folder: "..#folder:GetChildren().." | "..table.concat(sample,", ")
-				else
-					lblDebug.Text="No Monster folder!"
-				end
 				task.wait(1)
 				continue
 			end
@@ -465,31 +432,24 @@ task.spawn(function()
 
 			lblTarget.Text="Target: "..target.Name
 			lblIndex.Text="Queue: "..currentIndex.."/"..#monsterList
-			lblFarm.Text="Auto Monster: Hitting"
+			lblFarm.Text="Auto Monster: Teleporting"
 
-			-- Show what's inside monster for debug
-			local parts={}
-			for _,desc in ipairs(target:GetDescendants()) do
-				table.insert(parts, desc.Name)
-			end
-			lblDebug.Text="Inside: "..table.concat(parts,", ")
-
-			for i=1,touchHits do
-				if not autoMonsterOn then break end
+			-- Teleport above monster facing down
+			-- Keep re-teleporting during the wait time so player stays in position
+			local timer = 0
+			while timer < farmSpeed and autoMonsterOn do
 				if not target or not target.Parent then break end
-				local success=teleportAndAttack(target)
-				if success then totalHits+=1;lblHits.Text="Hits: "..totalHits end
-				task.wait(0.05)
+				teleportToMonster(target)
+				task.wait(0.1)
+				timer += 0.1
 			end
 
-			task.wait(farmSpeed)
 		else
 			monsterList={};currentIndex=0;lastLevel=-1
 			lblFarm.Text="Auto Monster: Off"
 			lblTarget.Text="Target: None"
 			lblCount.Text="Monsters: 0"
 			lblIndex.Text="Queue: 0/0"
-			lblDebug.Text="Debug: ---"
 			task.wait(0.5)
 		end
 	end
